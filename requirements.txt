@@ -2,3 +2,5 @@ Flask
 gunicorn
 PyJWT[crypto]
 requests
+openai
+pydantic
