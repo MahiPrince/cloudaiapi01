@@ -6,6 +6,10 @@ import jwt
 import requests
 from jwt import PyJWKClient
 from flask import Flask, jsonify, request
+from typing import Literal, Optional
+
+from openai import OpenAI
+from pydantic import BaseModel
 
 
 app = Flask(__name__)
@@ -46,6 +50,11 @@ SF_JWT_AUDIENCE = os.environ.get(
 )
 
 SF_API_VERSION = "67.0"
+
+openai_client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"]
+)
+
 
 
 def get_salesforce_private_key():
@@ -124,6 +133,301 @@ def require_auth(route):
         return route(*args, **kwargs)
 
     return wrapper
+
+
+
+# ============================================================
+# AI ROUTER
+# ============================================================
+
+class RouteDecision(BaseModel):
+
+    action: Literal[
+        "answer",
+        "reroute"
+    ]
+
+    route: Literal[
+        "simple",
+        "crm_read",
+        "crm_analysis",
+        "web_simple",
+        "web_research",
+        "workflow",
+        "deep_complex"
+    ]
+
+    target_model: Literal[
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol"
+    ]
+
+    reasoning_effort: Literal[
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+    ]
+
+    needs_salesforce: bool
+    needs_web: bool
+    needs_write: bool
+    requires_confirmation: bool
+
+    routing_note: str
+
+    # Required field, but can be null.
+    #
+    # action == answer:
+    #     answer contains the actual response.
+    #
+    # action == reroute:
+    #     answer should be null.
+    answer: Optional[str]
+
+
+ROUTER_INSTRUCTIONS = """
+You are the routing and lightweight-answer layer for an
+enterprise CRM AI assistant.
+
+You receive ONE user message.
+
+Your job is to do one of two things:
+
+1. ANSWER the request immediately if it is simple and does
+   not require private CRM data, current web information,
+   tools, workflows, or substantial reasoning.
+
+2. REROUTE the request to the correct model and capability
+   level if external data, Salesforce, web search, workflows,
+   or more substantial reasoning are required.
+
+
+============================================================
+ROUTES
+============================================================
+
+SIMPLE
+
+Use when:
+- The request can be answered from general knowledge.
+- No Salesforce data is needed.
+- No current/live web information is needed.
+- No external tools are needed.
+- No multi-step workflow is needed.
+- No user-specific private information is needed.
+
+For SIMPLE:
+action = "answer"
+route = "simple"
+target_model = "gpt-5.6-luna"
+reasoning_effort = "low"
+answer = the actual useful answer.
+
+
+------------------------------------------------------------
+
+CRM_READ
+
+Use when:
+- The user wants their Salesforce/CRM information.
+- It is primarily retrieval, filtering, lookup, counting,
+  or straightforward summarization.
+- Little strategic reasoning is required.
+
+Examples:
+"How many opportunities do I have?"
+"Show my deals above $100k."
+"What is the close date of the United Oil opportunity?"
+
+Use:
+target_model = "gpt-5.6-luna"
+reasoning_effort = "low"
+needs_salesforce = true
+
+
+------------------------------------------------------------
+
+CRM_ANALYSIS
+
+Use when:
+- Salesforce data is needed AND the user wants analysis,
+  prioritization, comparison, risk assessment,
+  recommendations, or strategic interpretation.
+
+Examples:
+"Which of my deals are most at risk?"
+"Which opportunities should I prioritize this week?"
+"Compare my pipeline and tell me where I should focus."
+
+Use:
+target_model = "gpt-5.6-terra"
+reasoning_effort = "medium" or "high"
+needs_salesforce = true
+
+
+------------------------------------------------------------
+
+WEB_SIMPLE
+
+Use when:
+- Current public information is needed.
+- The question is relatively straightforward.
+- One or a small number of web searches should be enough.
+
+Examples:
+"Who is the current CEO of Agilent?"
+"Did Thermo Fisher announce anything this week?"
+
+Use:
+target_model = "gpt-5.6-terra"
+reasoning_effort = "medium"
+needs_web = true
+
+
+------------------------------------------------------------
+
+WEB_RESEARCH
+
+Use when:
+- Multiple web searches or sources are likely needed.
+- Information must be compared or synthesized.
+- CRM information may need to be combined with web data.
+- Competitive intelligence or market research is requested.
+
+Examples:
+"Research recent United Oil news and tell me how it affects
+my opportunities."
+
+"Compare recent Agilent and Waters announcements with my
+current pipeline."
+
+Use:
+target_model = "gpt-5.6-terra"
+reasoning_effort = "high"
+needs_web = true
+
+Set needs_salesforce = true when CRM information is also
+required.
+
+
+------------------------------------------------------------
+
+WORKFLOW
+
+Use when:
+- The request requires several dependent actions.
+- The model must plan and execute multiple tool calls.
+- The request includes creating, changing, sending, updating,
+  or otherwise modifying state.
+- The task combines research, analysis and actions.
+
+Examples:
+"Find my best opportunities, research each company and create
+follow-up tasks."
+
+"Review all deals closing this month and update the next
+steps."
+
+Use:
+target_model = "gpt-5.6-terra"
+reasoning_effort = "high"
+
+Set needs_write = true if the task changes external data.
+
+Set requires_confirmation = true for consequential writes,
+bulk changes, deletions, sending communications, or actions
+that cannot easily be undone.
+
+
+------------------------------------------------------------
+
+DEEP_COMPLEX
+
+Use only when the request involves unusually difficult,
+high-value, ambiguous, multi-source strategic reasoning.
+
+Examples:
+"Build an executive account strategy across my pipeline,
+competitor activity, customer investments and market trends."
+
+"Analyze all available signals and propose a detailed
+commercial strategy for the next quarter."
+
+Use:
+target_model = "gpt-5.6-sol"
+reasoning_effort = "high", "xhigh", or "max"
+
+
+============================================================
+IMPORTANT RULES
+============================================================
+
+Never answer a question that depends on Salesforce data
+unless you actually have that Salesforce data.
+
+Never pretend you searched the web.
+
+Never invent user-specific CRM information.
+
+If current information is required, route to web access.
+
+If Salesforce information is required, route to Salesforce.
+
+If both are required, mark both needs_web and
+needs_salesforce true.
+
+Do not unnecessarily escalate simple requests.
+
+But prefer rerouting over giving an unreliable answer when
+external data or stronger reasoning is genuinely required.
+
+routing_note should be a short one-sentence explanation of
+why the route was selected. Do not provide hidden reasoning
+or a long analysis.
+
+When action is "reroute", answer must be null.
+
+When action is "answer", provide a useful final answer in
+answer.
+"""
+
+
+def route_or_answer(user_message):
+
+    response = openai_client.responses.parse(
+        model="gpt-5.6-luna",
+
+        reasoning={
+            "effort": "low"
+        },
+
+        store=False,
+
+        input=[
+            {
+                "role": "developer",
+                "content": ROUTER_INSTRUCTIONS,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ],
+
+        text_format=RouteDecision,
+    )
+
+    decision = response.output_parsed
+
+    if decision is None:
+        raise Exception(
+            "OpenAI router returned no parsed decision."
+        )
+
+    return decision
 
 
 # ============================================================
@@ -278,6 +582,118 @@ def me():
         "token_version":
             claims.get("ver"),
     })
+
+
+# ============================================================
+# CHAT - ROUTER TEST VERSION
+# ============================================================
+
+@app.post("/chat")
+@require_auth
+def chat():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    message = (
+        data.get("message")
+        or ""
+    ).strip()
+
+    if not message:
+
+        return jsonify({
+            "error": "message_required"
+        }), 400
+
+
+    claims = request.user_claims
+
+    try:
+
+        decision = route_or_answer(
+            message
+        )
+
+        result = decision.model_dump()
+
+
+        # --------------------------------------------
+        # SIMPLE
+        #
+        # Luna already answered it.
+        # No second model call required.
+        # --------------------------------------------
+
+        if decision.action == "answer":
+
+            return jsonify({
+
+                "status":
+                    "answered",
+
+                "router_model":
+                    "gpt-5.6-luna",
+
+                "user":
+                    claims.get(
+                        "preferred_username"
+                    ),
+
+                "route":
+                    result,
+
+                "answer":
+                    decision.answer,
+            })
+
+
+        # --------------------------------------------
+        # REROUTED
+        #
+        # In THIS TEST VERSION we deliberately
+        # stop here.
+        #
+        # Next build will actually execute this.
+        # --------------------------------------------
+
+        return jsonify({
+
+            "status":
+                "routed",
+
+            "router_model":
+                "gpt-5.6-luna",
+
+            "user":
+                claims.get(
+                    "preferred_username"
+                ),
+
+            "route":
+                result,
+
+            "message":
+                (
+                    "Routing successful. "
+                    "Execution is not enabled yet."
+                ),
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":
+                "router_failed",
+
+            "details":
+                str(e),
+
+        }), 500
+
 
 
 # ============================================================
