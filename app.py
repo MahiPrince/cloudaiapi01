@@ -7,7 +7,6 @@ from typing import Literal, Optional
 
 import jwt
 import requests
-
 from flask import Flask, jsonify, request
 from jwt import PyJWKClient
 from openai import OpenAI
@@ -22,7 +21,7 @@ app = Flask(__name__)
 
 
 # ============================================================
-# ENVIRONMENT CONFIGURATION
+# ENVIRONMENT CONFIG
 # ============================================================
 
 # Microsoft Entra
@@ -31,46 +30,27 @@ ENTRA_API_CLIENT_ID = os.environ["ENTRA_API_CLIENT_ID"]
 
 # Salesforce
 SF_CLIENT_ID = os.environ["SF_CLIENT_ID"]
-
-SF_LOGIN_URL = (
-    os.environ["SF_LOGIN_URL"]
-    .rstrip("/")
-)
-
-SF_JWT_PRIVATE_KEY = (
-    os.environ["SF_JWT_PRIVATE_KEY"]
-    .replace("\\n", "\n")
-)
-
-# Keep the exact audience from our previously working JWT flow.
+SF_LOGIN_URL = os.environ["SF_LOGIN_URL"].rstrip("/")
+SF_JWT_PRIVATE_KEY = os.environ["SF_JWT_PRIVATE_KEY"].replace("\\n", "\n")
 SF_JWT_AUDIENCE = "https://login.salesforce.com"
-
-# Can be overridden later without changing code.
-SF_API_VERSION = os.environ.get(
-    "SF_API_VERSION",
-    "67.0"
-)
+SF_API_VERSION = os.environ.get("SF_API_VERSION", "67.0")
 
 # OpenAI
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
+# Used only to sign short-lived write-confirmation tokens.
+# Generate a long random value and keep it only in Render.
+APP_SIGNING_SECRET = os.environ["APP_SIGNING_SECRET"]
 
-# ============================================================
-# OPENAI CLIENT
-# ============================================================
-
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# MICROSOFT ENTRA CONFIG
+# MICROSOFT ENTRA TOKEN VERIFICATION
 # ============================================================
 
 ENTRA_ISSUER = (
-    f"https://login.microsoftonline.com/"
-    f"{ENTRA_TENANT_ID}/v2.0"
+    f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/v2.0"
 )
 
 ENTRA_JWKS_URL = (
@@ -78,21 +58,11 @@ ENTRA_JWKS_URL = (
     f"{ENTRA_TENANT_ID}/discovery/v2.0/keys"
 )
 
-entra_jwks_client = PyJWKClient(
-    ENTRA_JWKS_URL
-)
+entra_jwks_client = PyJWKClient(ENTRA_JWKS_URL)
 
-
-# ============================================================
-# ENTRA ACCESS TOKEN VERIFICATION
-# ============================================================
 
 def verify_entra_access_token(token):
-
-    signing_key = (
-        entra_jwks_client
-        .get_signing_key_from_jwt(token)
-    )
+    signing_key = entra_jwks_client.get_signing_key_from_jwt(token)
 
     claims = jwt.decode(
         token,
@@ -102,72 +72,43 @@ def verify_entra_access_token(token):
         issuer=ENTRA_ISSUER,
     )
 
-    scopes = (
-        claims
-        .get("scp", "")
-        .split()
-    )
+    scopes = claims.get("scp", "").split()
 
     if "access_as_user" not in scopes:
-        raise Exception(
-            "Required scope access_as_user is missing."
-        )
+        raise Exception("Required scope access_as_user is missing.")
 
     return claims
 
 
 def require_auth(route_function):
-
     @wraps(route_function)
     def wrapper(*args, **kwargs):
-
-        auth_header = (
-            request.headers
-            .get("Authorization", "")
-        )
+        auth_header = request.headers.get("Authorization", "")
 
         if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "missing_bearer_token"}), 401
 
-            return jsonify({
-                "error": "missing_bearer_token"
-            }), 401
-
-        token = auth_header.split(
-            " ",
-            1
-        )[1]
+        token = auth_header.split(" ", 1)[1]
 
         try:
-
-            claims = verify_entra_access_token(
-                token
-            )
-
+            claims = verify_entra_access_token(token)
         except Exception as e:
-
             return jsonify({
                 "error": "invalid_token",
-                "details": str(e)
+                "details": str(e),
             }), 401
 
         request.user_claims = claims
-
-        return route_function(
-            *args,
-            **kwargs
-        )
+        return route_function(*args, **kwargs)
 
     return wrapper
 
 
 # ============================================================
-# SALESFORCE JWT BEARER AUTH
+# SALESFORCE AUTH + REST
 # ============================================================
 
-def get_salesforce_access_token(
-    salesforce_username
-):
-
+def get_salesforce_access_token(salesforce_username):
     now = int(time.time())
 
     payload = {
@@ -180,91 +121,75 @@ def get_salesforce_access_token(
     assertion = jwt.encode(
         payload,
         SF_JWT_PRIVATE_KEY,
-        algorithm="RS256"
-    )
-
-    token_url = (
-        f"{SF_LOGIN_URL}"
-        f"/services/oauth2/token"
+        algorithm="RS256",
     )
 
     response = requests.post(
-        token_url,
+        f"{SF_LOGIN_URL}/services/oauth2/token",
         data={
-            "grant_type":
-                "urn:ietf:params:oauth:"
-                "grant-type:jwt-bearer",
-
-            "assertion":
-                assertion,
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
         },
         timeout=30,
     )
 
     if not response.ok:
-
         raise Exception(
             "Salesforce authentication failed: "
-            f"{response.status_code} "
-            f"{response.text}"
+            f"{response.status_code} {response.text}"
         )
 
     data = response.json()
 
     return {
-        "access_token":
-            data["access_token"],
-
-        "instance_url":
-            data["instance_url"],
+        "access_token": data["access_token"],
+        "instance_url": data["instance_url"],
     }
 
 
-# ============================================================
-# GENERIC SALESFORCE QUERY
-# ============================================================
-
-def salesforce_query(
-    access_token,
-    instance_url,
-    soql
-):
-
-    url = (
-        f"{instance_url}"
-        f"/services/data/"
-        f"v{SF_API_VERSION}/query"
-    )
-
+def salesforce_query(access_token, instance_url, soql):
     response = requests.get(
-        url,
-        headers={
-            "Authorization":
-                f"Bearer {access_token}"
-        },
-        params={
-            "q": soql
-        },
+        f"{instance_url}/services/data/v{SF_API_VERSION}/query",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": soql},
         timeout=30,
     )
 
     if not response.ok:
-
         raise Exception(
             "Salesforce query failed: "
-            f"{response.status_code} "
-            f"{response.text}"
+            f"{response.status_code} {response.text}"
         )
 
     return response.json()
 
 
+def salesforce_update_opportunity(access_token, instance_url, opportunity_id, fields):
+    response = requests.patch(
+        f"{instance_url}/services/data/v{SF_API_VERSION}"
+        f"/sobjects/Opportunity/{opportunity_id}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=fields,
+        timeout=30,
+    )
+
+    if response.status_code != 204:
+        raise Exception(
+            "Salesforce update failed: "
+            f"{response.status_code} {response.text}"
+        )
+
+    return True
+
+
 # ============================================================
-# SAFE SOQL HELPERS
+# SAFE SOQL / VALUE HELPERS
 # ============================================================
 
 def soql_escape(value):
-
     if value is None:
         return None
 
@@ -276,7 +201,6 @@ def soql_escape(value):
 
 
 def soql_like_escape(value):
-
     if value is None:
         return None
 
@@ -290,34 +214,30 @@ def soql_like_escape(value):
 
 
 def validate_iso_date(value):
-
     if value is None:
         return None
 
-    date.fromisoformat(value)
+    date.fromisoformat(str(value))
+    return str(value)
 
-    return value
 
-
-def clamp_limit(
-    value,
-    default=25,
-    maximum=100
-):
-
+def clamp_limit(value, default=25, maximum=100):
     try:
         value = int(value)
-
     except Exception:
         return default
 
-    return max(
-        1,
-        min(
-            value,
-            maximum
-        )
-    )
+    return max(1, min(value, maximum))
+
+
+def values_equivalent(a, b):
+    if a is None and b is None:
+        return True
+
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+
+    return str(a) == str(b)
 
 
 # ============================================================
@@ -325,236 +245,79 @@ def clamp_limit(
 # ============================================================
 
 def format_account(account):
-
     if not account:
         return None
 
     return {
-
-        "id":
-            account.get("Id"),
-
-        "name":
-            account.get("Name"),
-
-        "industry":
-            account.get("Industry"),
-
-        "website":
-            account.get("Website"),
-
-        "phone":
-            account.get("Phone"),
-
-
-        # ----------------------------------------------------
-        # CUSTOMER / BILLING ADDRESS
-        # ----------------------------------------------------
+        "id": account.get("Id"),
+        "name": account.get("Name"),
+        "industry": account.get("Industry"),
+        "website": account.get("Website"),
+        "phone": account.get("Phone"),
 
         "billing_address": {
-
-            "street":
-                account.get(
-                    "BillingStreet"
-                ),
-
-            "city":
-                account.get(
-                    "BillingCity"
-                ),
-
-            "state":
-                account.get(
-                    "BillingState"
-                ),
-
-            "postal_code":
-                account.get(
-                    "BillingPostalCode"
-                ),
-
-            "country":
-                account.get(
-                    "BillingCountry"
-                ),
-
-            "latitude":
-                account.get(
-                    "BillingLatitude"
-                ),
-
-            "longitude":
-                account.get(
-                    "BillingLongitude"
-                ),
+            "street": account.get("BillingStreet"),
+            "city": account.get("BillingCity"),
+            "state": account.get("BillingState"),
+            "postal_code": account.get("BillingPostalCode"),
+            "country": account.get("BillingCountry"),
+            "latitude": account.get("BillingLatitude"),
+            "longitude": account.get("BillingLongitude"),
         },
 
-
-        # ----------------------------------------------------
-        # SHIPPING / SITE ADDRESS
-        # ----------------------------------------------------
-
         "shipping_address": {
-
-            "street":
-                account.get(
-                    "ShippingStreet"
-                ),
-
-            "city":
-                account.get(
-                    "ShippingCity"
-                ),
-
-            "state":
-                account.get(
-                    "ShippingState"
-                ),
-
-            "postal_code":
-                account.get(
-                    "ShippingPostalCode"
-                ),
-
-            "country":
-                account.get(
-                    "ShippingCountry"
-                ),
-
-            "latitude":
-                account.get(
-                    "ShippingLatitude"
-                ),
-
-            "longitude":
-                account.get(
-                    "ShippingLongitude"
-                ),
+            "street": account.get("ShippingStreet"),
+            "city": account.get("ShippingCity"),
+            "state": account.get("ShippingState"),
+            "postal_code": account.get("ShippingPostalCode"),
+            "country": account.get("ShippingCountry"),
+            "latitude": account.get("ShippingLatitude"),
+            "longitude": account.get("ShippingLongitude"),
         },
     }
 
 
 def format_contact(contact):
-
     if not contact:
         return None
 
     return {
-
-        "id":
-            contact.get("Id"),
-
-        "first_name":
-            contact.get("FirstName"),
-
-        "last_name":
-            contact.get("LastName"),
-
-        "name":
-            contact.get("Name"),
-
-        "title":
-            contact.get("Title"),
-
-        "department":
-            contact.get("Department"),
-
-        "email":
-            contact.get("Email"),
-
-        "phone":
-            contact.get("Phone"),
-
-        "mobile":
-            contact.get("MobilePhone"),
-
-        "account_id":
-            contact.get("AccountId"),
-
-
-        # ----------------------------------------------------
-        # CONTACT MAILING ADDRESS
-        # ----------------------------------------------------
+        "id": contact.get("Id"),
+        "first_name": contact.get("FirstName"),
+        "last_name": contact.get("LastName"),
+        "name": contact.get("Name"),
+        "title": contact.get("Title"),
+        "department": contact.get("Department"),
+        "email": contact.get("Email"),
+        "phone": contact.get("Phone"),
+        "mobile": contact.get("MobilePhone"),
+        "account_id": contact.get("AccountId"),
 
         "mailing_address": {
-
-            "street":
-                contact.get(
-                    "MailingStreet"
-                ),
-
-            "city":
-                contact.get(
-                    "MailingCity"
-                ),
-
-            "state":
-                contact.get(
-                    "MailingState"
-                ),
-
-            "postal_code":
-                contact.get(
-                    "MailingPostalCode"
-                ),
-
-            "country":
-                contact.get(
-                    "MailingCountry"
-                ),
-
-            "latitude":
-                contact.get(
-                    "MailingLatitude"
-                ),
-
-            "longitude":
-                contact.get(
-                    "MailingLongitude"
-                ),
+            "street": contact.get("MailingStreet"),
+            "city": contact.get("MailingCity"),
+            "state": contact.get("MailingState"),
+            "postal_code": contact.get("MailingPostalCode"),
+            "country": contact.get("MailingCountry"),
+            "latitude": contact.get("MailingLatitude"),
+            "longitude": contact.get("MailingLongitude"),
         },
 
-
-        # Customer attached to contact
-        "account":
-            format_account(
-                contact.get("Account")
-            ),
+        "account": format_account(contact.get("Account")),
     }
 
 
 # ============================================================
-# CRM TOOL:
-# SEARCH OPPORTUNITIES
+# CRM READ TOOLS
 # ============================================================
 
-def tool_search_opportunities(
-    sf,
-    salesforce_username,
-    args
-):
-
-    username = soql_escape(
-        salesforce_username
-    )
-
-    status = args.get(
-        "status",
-        "all"
-    )
-
-    limit = clamp_limit(
-        args.get("limit"),
-        default=25
-    )
-
-    include_contacts = bool(
-        args.get("include_contacts")
-    )
-
+def tool_search_opportunities(sf, salesforce_username, args):
+    username = soql_escape(salesforce_username)
+    status = args.get("status", "all")
+    limit = clamp_limit(args.get("limit"), default=25)
+    include_contacts = bool(args.get("include_contacts"))
 
     fields = [
-
         "Id",
         "Name",
         "StageName",
@@ -565,18 +328,17 @@ def tool_search_opportunities(
         "Type",
         "LeadSource",
         "ForecastCategoryName",
+        "Description",
         "IsClosed",
         "IsWon",
         "AccountId",
 
-        # Account/customer
         "Account.Id",
         "Account.Name",
         "Account.Industry",
         "Account.Website",
         "Account.Phone",
 
-        # Billing/customer address
         "Account.BillingStreet",
         "Account.BillingCity",
         "Account.BillingState",
@@ -585,7 +347,6 @@ def tool_search_opportunities(
         "Account.BillingLatitude",
         "Account.BillingLongitude",
 
-        # Shipping/site address
         "Account.ShippingStreet",
         "Account.ShippingCity",
         "Account.ShippingState",
@@ -595,13 +356,7 @@ def tool_search_opportunities(
         "Account.ShippingLongitude",
     ]
 
-
-    # --------------------------------------------------------
-    # OPPORTUNITY CONTACT ROLES
-    # --------------------------------------------------------
-
     if include_contacts:
-
         fields.append(
             """
             (
@@ -610,7 +365,6 @@ def tool_search_opportunities(
                     ContactId,
                     Role,
                     IsPrimary,
-
                     Contact.Id,
                     Contact.FirstName,
                     Contact.LastName,
@@ -620,7 +374,6 @@ def tool_search_opportunities(
                     Contact.Email,
                     Contact.Phone,
                     Contact.MobilePhone,
-
                     Contact.MailingStreet,
                     Contact.MailingCity,
                     Contact.MailingState,
@@ -628,191 +381,57 @@ def tool_search_opportunities(
                     Contact.MailingCountry,
                     Contact.MailingLatitude,
                     Contact.MailingLongitude
-
                 FROM OpportunityContactRoles
             )
             """
         )
 
-
-    # --------------------------------------------------------
-    # ALWAYS SCOPE OPPORTUNITIES TO AUTHENTICATED USER
-    # --------------------------------------------------------
-
-    where = [
-        f"Owner.Username = '{username}'"
-    ]
-
-
-    # --------------------------------------------------------
-    # STATUS FILTER
-    # --------------------------------------------------------
+    where = [f"Owner.Username = '{username}'"]
 
     if status == "open":
-
-        where.append(
-            "IsClosed = false"
-        )
-
+        where.append("IsClosed = false")
     elif status == "closed_won":
-
-        where.append(
-            "IsWon = true"
-        )
-
+        where.append("IsWon = true")
     elif status == "closed_lost":
-
-        where.append(
-            "IsClosed = true "
-            "AND IsWon = false"
-        )
-
-
-    # --------------------------------------------------------
-    # NAME FILTER
-    # --------------------------------------------------------
+        where.append("IsClosed = true AND IsWon = false")
 
     if args.get("name_contains"):
+        value = soql_like_escape(args["name_contains"])
+        where.append(f"Name LIKE '%{value}%'")
 
-        value = soql_like_escape(
-            args["name_contains"]
-        )
-
-        where.append(
-            f"Name LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # ACCOUNT NAME
-    # --------------------------------------------------------
-
-    if args.get(
-        "account_name_contains"
-    ):
-
-        value = soql_like_escape(
-            args[
-                "account_name_contains"
-            ]
-        )
-
-        where.append(
-            f"Account.Name "
-            f"LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # STAGE
-    # --------------------------------------------------------
+    if args.get("account_name_contains"):
+        value = soql_like_escape(args["account_name_contains"])
+        where.append(f"Account.Name LIKE '%{value}%'")
 
     if args.get("stage"):
+        value = soql_escape(args["stage"])
+        where.append(f"StageName = '{value}'")
 
-        value = soql_escape(
-            args["stage"]
-        )
+    if args.get("min_amount") is not None:
+        where.append(f"Amount >= {float(args['min_amount'])}")
 
-        where.append(
-            f"StageName = '{value}'"
-        )
+    if args.get("max_amount") is not None:
+        where.append(f"Amount <= {float(args['max_amount'])}")
 
+    if args.get("close_date_from"):
+        value = validate_iso_date(args["close_date_from"])
+        where.append(f"CloseDate >= {value}")
 
-    # --------------------------------------------------------
-    # AMOUNT
-    # --------------------------------------------------------
+    if args.get("close_date_to"):
+        value = validate_iso_date(args["close_date_to"])
+        where.append(f"CloseDate <= {value}")
 
-    if (
-        args.get("min_amount")
-        is not None
-    ):
-
-        min_amount = float(
-            args["min_amount"]
-        )
-
-        where.append(
-            f"Amount >= {min_amount}"
-        )
-
-
-    if (
-        args.get("max_amount")
-        is not None
-    ):
-
-        max_amount = float(
-            args["max_amount"]
-        )
-
-        where.append(
-            f"Amount <= {max_amount}"
-        )
-
-
-    # --------------------------------------------------------
-    # CLOSE DATE
-    # --------------------------------------------------------
-
-    if args.get(
-        "close_date_from"
-    ):
-
-        value = validate_iso_date(
-            args["close_date_from"]
-        )
-
-        where.append(
-            f"CloseDate >= {value}"
-        )
-
-
-    if args.get(
-        "close_date_to"
-    ):
-
-        value = validate_iso_date(
-            args["close_date_to"]
-        )
-
-        where.append(
-            f"CloseDate <= {value}"
-        )
-
-
-    # --------------------------------------------------------
-    # CUSTOMER LOCATION
-    # --------------------------------------------------------
+    if args.get("account_city"):
+        value = soql_escape(args["account_city"])
+        where.append(f"Account.BillingCity = '{value}'")
 
     if args.get("account_state"):
+        value = soql_escape(args["account_state"])
+        where.append(f"Account.BillingState = '{value}'")
 
-        value = soql_escape(
-            args["account_state"]
-        )
-
-        where.append(
-            f"Account.BillingState "
-            f"= '{value}'"
-        )
-
-
-    if args.get(
-        "account_country"
-    ):
-
-        value = soql_escape(
-            args["account_country"]
-        )
-
-        where.append(
-            f"Account.BillingCountry "
-            f"= '{value}'"
-        )
-
-
-    # --------------------------------------------------------
-    # BUILD QUERY
-    # --------------------------------------------------------
+    if args.get("account_country"):
+        value = soql_escape(args["account_country"])
+        where.append(f"Account.BillingCountry = '{value}'")
 
     soql = (
         "SELECT "
@@ -824,161 +443,57 @@ def tool_search_opportunities(
         + f"LIMIT {limit}"
     )
 
-
     data = salesforce_query(
         sf["access_token"],
         sf["instance_url"],
-        soql
+        soql,
     )
-
 
     opportunities = []
 
-
-    # --------------------------------------------------------
-    # FORMAT RESULTS
-    # --------------------------------------------------------
-
-    for row in data.get(
-        "records",
-        []
-    ):
-
+    for row in data.get("records", []):
         contacts = []
 
-
         if include_contacts:
+            contact_roles = row.get("OpportunityContactRoles") or {}
 
-            contact_roles = (
-                row.get(
-                    "OpportunityContactRoles"
-                )
-                or {}
-            )
-
-            for role in contact_roles.get(
-                "records",
-                []
-            ):
-
+            for role in contact_roles.get("records", []):
                 contacts.append({
-
-                    "role":
-                        role.get("Role"),
-
-                    "is_primary":
-                        role.get(
-                            "IsPrimary"
-                        ),
-
-                    "contact":
-                        format_contact(
-                            role.get(
-                                "Contact"
-                            )
-                        ),
+                    "role": role.get("Role"),
+                    "is_primary": role.get("IsPrimary"),
+                    "contact": format_contact(role.get("Contact")),
                 })
 
-
         opportunities.append({
-
-            "id":
-                row.get("Id"),
-
-            "name":
-                row.get("Name"),
-
-            "stage":
-                row.get(
-                    "StageName"
-                ),
-
-            "amount":
-                row.get("Amount"),
-
-            "close_date":
-                row.get(
-                    "CloseDate"
-                ),
-
-            "probability":
-                row.get(
-                    "Probability"
-                ),
-
-            "next_step":
-                row.get(
-                    "NextStep"
-                ),
-
-            "type":
-                row.get("Type"),
-
-            "lead_source":
-                row.get(
-                    "LeadSource"
-                ),
-
-            "forecast_category":
-                row.get(
-                    "ForecastCategoryName"
-                ),
-
-            "is_closed":
-                row.get(
-                    "IsClosed"
-                ),
-
-            "is_won":
-                row.get(
-                    "IsWon"
-                ),
-
-            "account":
-                format_account(
-                    row.get("Account")
-                ),
-
-            "contacts":
-                contacts,
+            "id": row.get("Id"),
+            "name": row.get("Name"),
+            "stage": row.get("StageName"),
+            "amount": row.get("Amount"),
+            "close_date": row.get("CloseDate"),
+            "probability": row.get("Probability"),
+            "next_step": row.get("NextStep"),
+            "type": row.get("Type"),
+            "lead_source": row.get("LeadSource"),
+            "forecast_category": row.get("ForecastCategoryName"),
+            "description": row.get("Description"),
+            "is_closed": row.get("IsClosed"),
+            "is_won": row.get("IsWon"),
+            "account": format_account(row.get("Account")),
+            "contacts": contacts,
         })
 
-
     return {
-
         "ok": True,
-
-        "count":
-            len(opportunities),
-
-        "opportunities":
-            opportunities,
+        "count": len(opportunities),
+        "opportunities": opportunities,
     }
 
 
-# ============================================================
-# CRM TOOL:
-# SEARCH CONTACTS
-# ============================================================
-
-def tool_search_contacts(
-    sf,
-    salesforce_username,
-    args
-):
-
-    username = soql_escape(
-        salesforce_username
-    )
-
-    limit = clamp_limit(
-        args.get("limit"),
-        default=25
-    )
-
+def tool_search_contacts(sf, salesforce_username, args):
+    username = soql_escape(salesforce_username)
+    limit = clamp_limit(args.get("limit"), default=25)
 
     fields = [
-
         "Id",
         "FirstName",
         "LastName",
@@ -990,7 +505,6 @@ def tool_search_contacts(
         "MobilePhone",
         "AccountId",
 
-        # Contact mailing address
         "MailingStreet",
         "MailingCity",
         "MailingState",
@@ -999,14 +513,12 @@ def tool_search_contacts(
         "MailingLatitude",
         "MailingLongitude",
 
-        # Customer
         "Account.Id",
         "Account.Name",
         "Account.Industry",
         "Account.Website",
         "Account.Phone",
 
-        # Customer billing address
         "Account.BillingStreet",
         "Account.BillingCity",
         "Account.BillingState",
@@ -1015,7 +527,6 @@ def tool_search_contacts(
         "Account.BillingLatitude",
         "Account.BillingLongitude",
 
-        # Customer shipping/site address
         "Account.ShippingStreet",
         "Account.ShippingCity",
         "Account.ShippingState",
@@ -1025,112 +536,40 @@ def tool_search_contacts(
         "Account.ShippingLongitude",
     ]
 
-
-    # --------------------------------------------------------
-    # ONLY CONTACTS FROM ACCOUNTS THAT HAVE USER'S OPPS
-    # --------------------------------------------------------
-
     where = [
-
         (
             "AccountId IN "
             "("
-                "SELECT AccountId "
-                "FROM Opportunity "
-                "WHERE Owner.Username "
-                f"= '{username}'"
+            "SELECT AccountId "
+            "FROM Opportunity "
+            f"WHERE Owner.Username = '{username}'"
             ")"
         )
     ]
 
-
-    # --------------------------------------------------------
-    # CONTACT NAME
-    # --------------------------------------------------------
-
     if args.get("name_contains"):
+        value = soql_like_escape(args["name_contains"])
+        where.append(f"Name LIKE '%{value}%'")
 
-        value = soql_like_escape(
-            args["name_contains"]
-        )
+    if args.get("title_contains"):
+        value = soql_like_escape(args["title_contains"])
+        where.append(f"Title LIKE '%{value}%'")
 
-        where.append(
-            f"Name LIKE '%{value}%'"
-        )
+    if args.get("account_name_contains"):
+        value = soql_like_escape(args["account_name_contains"])
+        where.append(f"Account.Name LIKE '%{value}%'")
 
+    if args.get("account_city"):
+        value = soql_escape(args["account_city"])
+        where.append(f"Account.BillingCity = '{value}'")
 
-    # --------------------------------------------------------
-    # TITLE
-    # --------------------------------------------------------
+    if args.get("account_state"):
+        value = soql_escape(args["account_state"])
+        where.append(f"Account.BillingState = '{value}'")
 
-    if args.get(
-        "title_contains"
-    ):
-
-        value = soql_like_escape(
-            args["title_contains"]
-        )
-
-        where.append(
-            f"Title LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # CUSTOMER NAME
-    # --------------------------------------------------------
-
-    if args.get(
-        "account_name_contains"
-    ):
-
-        value = soql_like_escape(
-            args[
-                "account_name_contains"
-            ]
-        )
-
-        where.append(
-            f"Account.Name "
-            f"LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # CUSTOMER STATE
-    # --------------------------------------------------------
-
-    if args.get(
-        "account_state"
-    ):
-
-        value = soql_escape(
-            args["account_state"]
-        )
-
-        where.append(
-            f"Account.BillingState "
-            f"= '{value}'"
-        )
-
-
-    # --------------------------------------------------------
-    # CUSTOMER COUNTRY
-    # --------------------------------------------------------
-
-    if args.get(
-        "account_country"
-    ):
-
-        value = soql_escape(
-            args["account_country"]
-        )
-
-        where.append(
-            f"Account.BillingCountry "
-            f"= '{value}'"
-        )
-
+    if args.get("account_country"):
+        value = soql_escape(args["account_country"])
+        where.append(f"Account.BillingCountry = '{value}'")
 
     soql = (
         "SELECT "
@@ -1142,67 +581,35 @@ def tool_search_contacts(
         + f"LIMIT {limit}"
     )
 
-
     data = salesforce_query(
         sf["access_token"],
         sf["instance_url"],
-        soql
+        soql,
     )
 
-
     contacts = [
-
         format_contact(row)
-
-        for row in data.get(
-            "records",
-            []
-        )
+        for row in data.get("records", [])
     ]
 
-
     return {
-
         "ok": True,
-
-        "count":
-            len(contacts),
-
-        "contacts":
-            contacts,
+        "count": len(contacts),
+        "contacts": contacts,
     }
 
 
-# ============================================================
-# CRM TOOL:
-# SEARCH ACCOUNTS / CUSTOMERS
-# ============================================================
-
-def tool_search_accounts(
-    sf,
-    salesforce_username,
-    args
-):
-
-    username = soql_escape(
-        salesforce_username
-    )
-
-    limit = clamp_limit(
-        args.get("limit"),
-        default=25
-    )
-
+def tool_search_accounts(sf, salesforce_username, args):
+    username = soql_escape(salesforce_username)
+    limit = clamp_limit(args.get("limit"), default=25)
 
     fields = [
-
         "Id",
         "Name",
         "Industry",
         "Website",
         "Phone",
 
-        # Billing/customer address
         "BillingStreet",
         "BillingCity",
         "BillingState",
@@ -1211,7 +618,6 @@ def tool_search_accounts(
         "BillingLatitude",
         "BillingLongitude",
 
-        # Shipping/site address
         "ShippingStreet",
         "ShippingCity",
         "ShippingState",
@@ -1221,105 +627,36 @@ def tool_search_accounts(
         "ShippingLongitude",
     ]
 
-
-    # --------------------------------------------------------
-    # ONLY CUSTOMER ACCOUNTS RELATED TO USER'S OPPORTUNITIES
-    # --------------------------------------------------------
-
     where = [
-
         (
             "Id IN "
             "("
-                "SELECT AccountId "
-                "FROM Opportunity "
-                "WHERE Owner.Username "
-                f"= '{username}'"
+            "SELECT AccountId "
+            "FROM Opportunity "
+            f"WHERE Owner.Username = '{username}'"
             ")"
         )
     ]
 
+    if args.get("name_contains"):
+        value = soql_like_escape(args["name_contains"])
+        where.append(f"Name LIKE '%{value}%'")
 
-    # --------------------------------------------------------
-    # NAME
-    # --------------------------------------------------------
-
-    if args.get(
-        "name_contains"
-    ):
-
-        value = soql_like_escape(
-            args["name_contains"]
-        )
-
-        where.append(
-            f"Name LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # INDUSTRY
-    # --------------------------------------------------------
-
-    if args.get(
-        "industry_contains"
-    ):
-
-        value = soql_like_escape(
-            args[
-                "industry_contains"
-            ]
-        )
-
-        where.append(
-            f"Industry LIKE '%{value}%'"
-        )
-
-
-    # --------------------------------------------------------
-    # CITY
-    # --------------------------------------------------------
+    if args.get("industry_contains"):
+        value = soql_like_escape(args["industry_contains"])
+        where.append(f"Industry LIKE '%{value}%'")
 
     if args.get("city"):
-
-        value = soql_escape(
-            args["city"]
-        )
-
-        where.append(
-            f"BillingCity = '{value}'"
-        )
-
-
-    # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
+        value = soql_escape(args["city"])
+        where.append(f"BillingCity = '{value}'")
 
     if args.get("state"):
-
-        value = soql_escape(
-            args["state"]
-        )
-
-        where.append(
-            f"BillingState = '{value}'"
-        )
-
-
-    # --------------------------------------------------------
-    # COUNTRY
-    # --------------------------------------------------------
+        value = soql_escape(args["state"])
+        where.append(f"BillingState = '{value}'")
 
     if args.get("country"):
-
-        value = soql_escape(
-            args["country"]
-        )
-
-        where.append(
-            f"BillingCountry = '{value}'"
-        )
-
+        value = soql_escape(args["country"])
+        where.append(f"BillingCountry = '{value}'")
 
     soql = (
         "SELECT "
@@ -1331,175 +668,215 @@ def tool_search_accounts(
         + f"LIMIT {limit}"
     )
 
-
     data = salesforce_query(
         sf["access_token"],
         sf["instance_url"],
-        soql
+        soql,
     )
 
-
     accounts = [
-
         format_account(row)
-
-        for row in data.get(
-            "records",
-            []
-        )
+        for row in data.get("records", [])
     ]
 
-
     return {
-
         "ok": True,
-
-        "count":
-            len(accounts),
-
-        "accounts":
-            accounts,
+        "count": len(accounts),
+        "accounts": accounts,
     }
 
 
 # ============================================================
-# OPENAI CRM TOOL DEFINITIONS
+# SALESFORCE WRITE PROPOSAL TOOL
+# ============================================================
+
+ALLOWED_OPPORTUNITY_WRITE_FIELDS = {
+    "StageName",
+    "CloseDate",
+    "NextStep",
+    "Amount",
+    "Probability",
+    "Description",
+}
+
+
+def normalize_opportunity_write_value(field_name, new_value):
+    if field_name not in ALLOWED_OPPORTUNITY_WRITE_FIELDS:
+        raise ValueError(
+            f"Field {field_name} is not allowed for AI updates."
+        )
+
+    if field_name == "StageName":
+        if not isinstance(new_value, str) or not new_value.strip():
+            raise ValueError("StageName must be a non-empty string.")
+        return new_value.strip()
+
+    if field_name == "CloseDate":
+        if new_value is None:
+            raise ValueError("CloseDate cannot be null.")
+        return validate_iso_date(new_value)
+
+    if field_name == "NextStep":
+        if new_value is None:
+            return None
+        if not isinstance(new_value, str):
+            raise ValueError("NextStep must be text or null.")
+        return new_value.strip()
+
+    if field_name == "Amount":
+        if new_value is None:
+            return None
+        value = float(new_value)
+        if value < 0:
+            raise ValueError("Amount cannot be negative.")
+        return value
+
+    if field_name == "Probability":
+        if new_value is None:
+            return None
+        value = float(new_value)
+        if value < 0 or value > 100:
+            raise ValueError("Probability must be between 0 and 100.")
+        return value
+
+    if field_name == "Description":
+        if new_value is None:
+            return None
+        if not isinstance(new_value, str):
+            raise ValueError("Description must be text or null.")
+        return new_value
+
+    raise ValueError("Unsupported opportunity field.")
+
+
+def get_owned_opportunity_field(
+    sf,
+    salesforce_username,
+    opportunity_id,
+    field_name,
+):
+    if field_name not in ALLOWED_OPPORTUNITY_WRITE_FIELDS:
+        raise ValueError("Field is not allowed.")
+
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(opportunity_id)
+
+    soql = (
+        f"SELECT Id, Name, {field_name} "
+        "FROM Opportunity "
+        f"WHERE Id = '{safe_id}' "
+        f"AND Owner.Username = '{safe_username}' "
+        "LIMIT 1"
+    )
+
+    data = salesforce_query(
+        sf["access_token"],
+        sf["instance_url"],
+        soql,
+    )
+
+    records = data.get("records", [])
+
+    if not records:
+        raise ValueError(
+            "Opportunity was not found in the authenticated user's owned records."
+        )
+
+    row = records[0]
+
+    return {
+        "id": row.get("Id"),
+        "name": row.get("Name"),
+        "field_name": field_name,
+        "current_value": row.get(field_name),
+    }
+
+
+def tool_propose_update_opportunity(
+    sf,
+    salesforce_username,
+    args,
+):
+    opportunity_id = args["opportunity_id"]
+    field_name = args["field_name"]
+    new_value = normalize_opportunity_write_value(
+        field_name,
+        args.get("new_value"),
+    )
+
+    current = get_owned_opportunity_field(
+        sf,
+        salesforce_username,
+        opportunity_id,
+        field_name,
+    )
+
+    action = {
+        "action": "update_opportunity",
+        "opportunity_id": current["id"],
+        "opportunity_name": current["name"],
+        "field_name": field_name,
+        "old_value": current["current_value"],
+        "new_value": new_value,
+    }
+
+    return {
+        "ok": True,
+        "status": "pending_confirmation",
+        "message": (
+            "The update has NOT been written to Salesforce. "
+            "It is queued for explicit user confirmation."
+        ),
+        "pending_action": action,
+    }
+
+
+# ============================================================
+# OPENAI FUNCTION TOOL DEFINITIONS
 # ============================================================
 
 CRM_READ_TOOLS = [
-
-    # ========================================================
-    # OPPORTUNITY SEARCH
-    # ========================================================
-
     {
         "type": "function",
-
-        "name":
-            "search_opportunities",
-
-        "description":
-            (
-                "Search the authenticated user's Salesforce "
-                "opportunities. Returns opportunity details, "
-                "customer/account information including "
-                "billing and shipping addresses, and optionally "
-                "contacts associated through Opportunity "
-                "Contact Roles."
-            ),
-
+        "name": "search_opportunities",
+        "description": (
+            "Search the authenticated user's Salesforce opportunities. "
+            "Returns opportunity details, customer/account information "
+            "including billing and shipping addresses, and optionally "
+            "contacts through Opportunity Contact Roles."
+        ),
         "strict": True,
-
         "parameters": {
-
             "type": "object",
-
             "properties": {
-
-                "name_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "account_name_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
+                "name_contains": {"type": ["string", "null"]},
+                "account_name_contains": {"type": ["string", "null"]},
                 "status": {
-
-                    "type":
-                        "string",
-
-                    "enum": [
-                        "all",
-                        "open",
-                        "closed_won",
-                        "closed_lost"
-                    ]
+                    "type": "string",
+                    "enum": ["all", "open", "closed_won", "closed_lost"],
                 },
-
-                "stage": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "min_amount": {
-                    "type": [
-                        "number",
-                        "null"
-                    ]
-                },
-
-                "max_amount": {
-                    "type": [
-                        "number",
-                        "null"
-                    ]
-                },
-
+                "stage": {"type": ["string", "null"]},
+                "min_amount": {"type": ["number", "null"]},
+                "max_amount": {"type": ["number", "null"]},
                 "close_date_from": {
-
-                    "type": [
-                        "string",
-                        "null"
-                    ],
-
-                    "description":
-                        "ISO date YYYY-MM-DD."
+                    "type": ["string", "null"],
+                    "description": "ISO date YYYY-MM-DD.",
                 },
-
                 "close_date_to": {
-
-                    "type": [
-                        "string",
-                        "null"
-                    ],
-
-                    "description":
-                        "ISO date YYYY-MM-DD."
+                    "type": ["string", "null"],
+                    "description": "ISO date YYYY-MM-DD.",
                 },
-
-                "account_state": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "account_country": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "include_contacts": {
-                    "type":
-                        "boolean"
-                },
-
+                "account_city": {"type": ["string", "null"]},
+                "account_state": {"type": ["string", "null"]},
+                "account_country": {"type": ["string", "null"]},
+                "include_contacts": {"type": "boolean"},
                 "limit": {
-
-                    "type":
-                        "integer",
-
-                    "minimum":
-                        1,
-
-                    "maximum":
-                        100
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
                 },
             },
-
             "required": [
-
                 "name_contains",
                 "account_name_contains",
                 "status",
@@ -1508,284 +885,196 @@ CRM_READ_TOOLS = [
                 "max_amount",
                 "close_date_from",
                 "close_date_to",
+                "account_city",
                 "account_state",
                 "account_country",
                 "include_contacts",
-                "limit"
+                "limit",
             ],
-
-            "additionalProperties":
-                False,
+            "additionalProperties": False,
         },
     },
 
-
-    # ========================================================
-    # CONTACT SEARCH
-    # ========================================================
-
     {
-        "type":
-            "function",
-
-        "name":
-            "search_contacts",
-
-        "description":
-            (
-                "Search contacts belonging to customer "
-                "accounts connected to opportunities owned "
-                "by the authenticated Salesforce user. "
-                "Returns contact name, title, department, "
-                "email, phone, mobile number, mailing "
-                "address and customer/account information."
-            ),
-
-        "strict":
-            True,
-
+        "type": "function",
+        "name": "search_contacts",
+        "description": (
+            "Search contacts belonging to customer accounts connected "
+            "to opportunities owned by the authenticated Salesforce user. "
+            "Returns title, department, email, phone, mailing address, "
+            "and associated customer/account information."
+        ),
+        "strict": True,
         "parameters": {
-
-            "type":
-                "object",
-
+            "type": "object",
             "properties": {
-
-                "name_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "title_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "account_name_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "account_state": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "account_country": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
+                "name_contains": {"type": ["string", "null"]},
+                "title_contains": {"type": ["string", "null"]},
+                "account_name_contains": {"type": ["string", "null"]},
+                "account_city": {"type": ["string", "null"]},
+                "account_state": {"type": ["string", "null"]},
+                "account_country": {"type": ["string", "null"]},
                 "limit": {
-
-                    "type":
-                        "integer",
-
-                    "minimum":
-                        1,
-
-                    "maximum":
-                        100
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
                 },
             },
-
             "required": [
-
                 "name_contains",
                 "title_contains",
                 "account_name_contains",
+                "account_city",
                 "account_state",
                 "account_country",
-                "limit"
+                "limit",
             ],
-
-            "additionalProperties":
-                False,
+            "additionalProperties": False,
         },
     },
 
-
-    # ========================================================
-    # ACCOUNT / CUSTOMER SEARCH
-    # ========================================================
-
     {
-        "type":
-            "function",
-
-        "name":
-            "search_accounts",
-
-        "description":
-            (
-                "Search customer accounts associated with "
-                "opportunities owned by the authenticated "
-                "Salesforce user. Returns customer name, "
-                "industry, website, phone, billing address, "
-                "shipping/site address and coordinates "
-                "when populated in Salesforce."
-            ),
-
-        "strict":
-            True,
-
+        "type": "function",
+        "name": "search_accounts",
+        "description": (
+            "Search customer accounts associated with opportunities "
+            "owned by the authenticated Salesforce user. Returns customer "
+            "name, industry, website, phone, billing address, shipping/site "
+            "address, and coordinates when populated."
+        ),
+        "strict": True,
         "parameters": {
-
-            "type":
-                "object",
-
+            "type": "object",
             "properties": {
-
-                "name_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "industry_contains": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "city": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "state": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
-                "country": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-
+                "name_contains": {"type": ["string", "null"]},
+                "industry_contains": {"type": ["string", "null"]},
+                "city": {"type": ["string", "null"]},
+                "state": {"type": ["string", "null"]},
+                "country": {"type": ["string", "null"]},
                 "limit": {
-
-                    "type":
-                        "integer",
-
-                    "minimum":
-                        1,
-
-                    "maximum":
-                        100
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
                 },
             },
-
             "required": [
-
                 "name_contains",
                 "industry_contains",
                 "city",
                 "state",
                 "country",
-                "limit"
+                "limit",
             ],
-
-            "additionalProperties":
-                False,
+            "additionalProperties": False,
         },
     },
 ]
 
 
+CRM_WRITE_TOOLS = [
+    {
+        "type": "function",
+        "name": "propose_update_opportunity",
+        "description": (
+            "Propose changing ONE allowed field on an opportunity owned by "
+            "the authenticated user. This tool NEVER writes immediately. "
+            "It creates a pending change that requires explicit user confirmation."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "opportunity_id": {
+                    "type": "string",
+                    "description": "Salesforce Opportunity Id.",
+                },
+                "field_name": {
+                    "type": "string",
+                    "enum": [
+                        "StageName",
+                        "CloseDate",
+                        "NextStep",
+                        "Amount",
+                        "Probability",
+                        "Description",
+                    ],
+                },
+                "new_value": {
+                    "type": ["string", "number", "null"],
+                    "description": (
+                        "New value. CloseDate must be YYYY-MM-DD. "
+                        "Probability must be 0-100."
+                    ),
+                },
+            },
+            "required": [
+                "opportunity_id",
+                "field_name",
+                "new_value",
+            ],
+            "additionalProperties": False,
+        },
+    }
+]
+
+
 # ============================================================
-# CRM TOOL DISPATCHER
+# CRM FUNCTION DISPATCH
 # ============================================================
 
-def run_crm_tool(
+def run_function_tool(
     tool_name,
     arguments,
     sf,
-    salesforce_username
+    salesforce_username,
 ):
-
     try:
-
-        if (
-            tool_name
-            == "search_opportunities"
-        ):
-
+        if tool_name == "search_opportunities":
             return tool_search_opportunities(
                 sf,
                 salesforce_username,
-                arguments
+                arguments,
             )
 
-
-        if (
-            tool_name
-            == "search_contacts"
-        ):
-
+        if tool_name == "search_contacts":
             return tool_search_contacts(
                 sf,
                 salesforce_username,
-                arguments
+                arguments,
             )
 
-
-        if (
-            tool_name
-            == "search_accounts"
-        ):
-
+        if tool_name == "search_accounts":
             return tool_search_accounts(
                 sf,
                 salesforce_username,
-                arguments
+                arguments,
             )
 
+        if tool_name == "propose_update_opportunity":
+            return tool_propose_update_opportunity(
+                sf,
+                salesforce_username,
+                arguments,
+            )
 
         return {
             "ok": False,
-            "error":
-                f"Unknown CRM tool: "
-                f"{tool_name}"
+            "error": f"Unknown function tool: {tool_name}",
         }
 
-
     except Exception as e:
-
         return {
             "ok": False,
-            "error": str(e)
+            "error": str(e),
         }
 
 
 # ============================================================
-# AI ROUTER STRUCTURED OUTPUT
+# ROUTER
 # ============================================================
 
 class RouteDecision(BaseModel):
-
-    action: Literal[
-        "answer",
-        "reroute"
-    ]
+    action: Literal["answer", "reroute"]
 
     route: Literal[
         "simple",
@@ -1794,13 +1083,13 @@ class RouteDecision(BaseModel):
         "web_simple",
         "web_research",
         "workflow",
-        "deep_complex"
+        "deep_complex",
     ]
 
     target_model: Literal[
         "gpt-5.6-luna",
         "gpt-5.6-terra",
-        "gpt-5.6-sol"
+        "gpt-5.6-sol",
     ]
 
     reasoning_effort: Literal[
@@ -1808,1251 +1097,824 @@ class RouteDecision(BaseModel):
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
     ]
 
     needs_salesforce: bool
-
     needs_web: bool
-
     needs_write: bool
-
     requires_confirmation: bool
-
     routing_note: str
-
     answer: Optional[str]
 
 
-# ============================================================
-# ROUTER INSTRUCTIONS
-# ============================================================
-
 ROUTER_INSTRUCTIONS = """
-You are the intelligent routing layer for an enterprise
-sales CRM AI assistant.
+You are the intelligent routing layer for an enterprise sales CRM AI assistant.
 
 You receive one user request.
 
-You must either:
+Either answer it directly when it is genuinely simple, or route it to an
+execution tier.
 
-1. Answer it directly when it is genuinely simple and needs
-   no private CRM data, live information, tools or substantial
-   analysis.
+ROUTES
 
-OR
-
-2. Route it to the appropriate execution tier.
-
-
-============================================================
 SIMPLE
-============================================================
+- General knowledge only.
+- No Salesforce.
+- No web/current information.
+- No workflow.
+Use Luna low and answer directly.
 
-Use when the question can be answered from general knowledge.
-
-No Salesforce.
-No web.
-No user-specific private data.
-No workflow.
-
-Examples:
-
-"What is a Salesforce opportunity?"
-"What does pipeline mean?"
-
-Use:
-
-action = answer
-route = simple
-target_model = gpt-5.6-luna
-reasoning_effort = low
-
-Return the useful answer in the answer field.
-
-
-============================================================
 CRM_READ
-============================================================
+- Salesforce retrieval/filtering/counting/straightforward summarization.
+- Opportunities, accounts, customers, addresses, contacts, contact roles.
+Use Luna low. needs_salesforce=true.
 
-Use when Salesforce data is required but the operation is
-primarily retrieval, filtering, counting or straightforward
-summarization.
-
-This includes:
-
-- Opportunities
-- Accounts
-- Customers
-- Customer addresses
-- Contacts
-- Contact details
-- Contact roles
-- Opportunity amounts
-- Close dates
-- Stages
-- Customer locations
-
-Examples:
-
-"List all my opportunities."
-
-"Show me customers in California."
-
-"Who are my contacts at United Oil?"
-
-"What is the address of this customer?"
-
-Use:
-
-action = reroute
-route = crm_read
-target_model = gpt-5.6-luna
-reasoning_effort = low
-needs_salesforce = true
-
-
-============================================================
 CRM_ANALYSIS
-============================================================
+- Salesforce data plus comparison, prioritization, risk assessment,
+  recommendations, or strategic interpretation.
+Use Terra medium/high. needs_salesforce=true.
 
-Use when Salesforce data is needed AND the user wants:
-
-- comparison
-- prioritization
-- risk assessment
-- interpretation
-- recommendations
-- strategic analysis
-
-Examples:
-
-"Which three opportunities look most at risk?"
-
-"Which accounts should I prioritize?"
-
-"Analyze my pipeline."
-
-Use:
-
-action = reroute
-route = crm_analysis
-target_model = gpt-5.6-terra
-reasoning_effort = medium or high
-needs_salesforce = true
-
-
-============================================================
 WEB_SIMPLE
-============================================================
+- Current public information is required and the task is straightforward.
+Use Terra medium. needs_web=true.
 
-Use when current public information is required but the task
-is straightforward.
-
-Examples:
-
-"Who is the current CEO of Agilent?"
-
-"Did Thermo Fisher announce anything today?"
-
-Use:
-
-action = reroute
-route = web_simple
-target_model = gpt-5.6-terra
-reasoning_effort = medium
-needs_web = true
-
-
-============================================================
 WEB_RESEARCH
-============================================================
+- Multiple searches/sources/comparisons, competitive intelligence, or
+  CRM + current web synthesis.
+Use Terra high. needs_web=true.
+Set needs_salesforce=true when CRM data is also required.
 
-Use when multiple searches, sources or comparisons are
-required.
-
-Also use this when Salesforce and current web information
-must be synthesized.
-
-Examples:
-
-"Research recent United Oil developments and compare them
-with my open opportunities."
-
-"Research Agilent and Waters and tell me how their activity
-affects my pipeline."
-
-Use:
-
-action = reroute
-route = web_research
-target_model = gpt-5.6-terra
-reasoning_effort = high
-needs_web = true
-
-Set needs_salesforce true when CRM data is also necessary.
-
-
-============================================================
 WORKFLOW
-============================================================
+- Several dependent actions, or any request to change Salesforce.
+- Research + analysis + action also belongs here.
+Use Terra high.
+Set needs_salesforce=true for Salesforce work.
+Set needs_web=true when current public research is requested.
+Set needs_write=true for Salesforce changes.
+All Salesforce writes require explicit confirmation:
+requires_confirmation=true.
 
-Use for multi-step actions or state-changing tasks.
-
-Examples:
-
-"Research my largest accounts, make a follow-up plan and
-update every opportunity."
-
-"Find customers I should contact and create follow-up tasks."
-
-Use:
-
-action = reroute
-route = workflow
-target_model = gpt-5.6-terra
-reasoning_effort = high
-
-Set needs_write = true whenever external data would be changed.
-
-Set requires_confirmation = true for:
-
-- Salesforce writes
-- bulk changes
-- deletions
-- sending communications
-- other consequential actions
-
-
-============================================================
 DEEP_COMPLEX
-============================================================
+- Very broad, difficult, high-value, multi-source strategic reasoning.
+Use Sol high/xhigh/max.
+Set needs_salesforce and needs_web as required.
+If the user also asks for writes, needs_write=true and
+requires_confirmation=true.
 
-Use for unusually difficult, broad, high-value or
-multi-source strategic reasoning.
+RULES
 
-Examples:
-
-"Analyze my entire win/loss history, research every potential
-customer in my territory and identify the strongest new leads."
-
-"Build a full commercial strategy from CRM history,
-competitor activity, market changes and customer signals."
-
-Use:
-
-action = reroute
-route = deep_complex
-target_model = gpt-5.6-sol
-reasoning_effort = high, xhigh or max
-
-
-============================================================
-CRITICAL RULES
-============================================================
-
-Never fabricate Salesforce information.
-
-Never answer Salesforce-specific questions without actually
-using Salesforce data.
-
-Never pretend that web research was performed.
-
-Never fabricate customer names, opportunity values, contact
-details, addresses, emails or phone numbers.
-
-If Salesforce is needed:
-needs_salesforce = true.
-
-If current public information is needed:
-needs_web = true.
-
-If both are required:
-set both true.
-
-If external state must change:
-needs_write = true.
-
-If the request requires consequential writes:
-requires_confirmation = true.
-
-Do not unnecessarily escalate simple requests.
-
-But do not answer from assumptions when real CRM or live data
-is required.
-
-routing_note must be a short explanation of the selected
-route. It must not contain private chain-of-thought.
-
-When action = reroute:
-answer must be null.
-
-When action = answer:
-answer must contain the final user-facing answer.
+Never fabricate Salesforce data.
+Never answer Salesforce-specific questions without Salesforce data.
+Never pretend web research occurred.
+If current information is required, needs_web=true.
+If Salesforce data is required, needs_salesforce=true.
+If Salesforce changes are requested, needs_write=true.
+Every Salesforce write requires explicit confirmation.
+Do not unnecessarily escalate simple work.
+routing_note must be a short explanation, not chain-of-thought.
+When action=reroute, answer must be null.
+When action=answer, answer contains the final user-facing answer.
 """
 
 
-# ============================================================
-# ROUTER
-# ============================================================
-
-def route_or_answer(
-    user_message
-):
-
-    response = (
-        openai_client
-        .responses
-        .parse(
-            model="gpt-5.6-luna",
-
-            reasoning={
-                "effort": "low"
+def route_or_answer(user_message):
+    response = openai_client.responses.parse(
+        model="gpt-5.6-luna",
+        reasoning={"effort": "low"},
+        store=False,
+        input=[
+            {
+                "role": "developer",
+                "content": (
+                    ROUTER_INSTRUCTIONS
+                    + "\n\nCurrent date: "
+                    + date.today().isoformat()
+                ),
             },
-
-            store=False,
-
-            input=[
-
-                {
-                    "role":
-                        "developer",
-
-                    "content":
-                        ROUTER_INSTRUCTIONS,
-                },
-
-                {
-                    "role":
-                        "user",
-
-                    "content":
-                        user_message,
-                },
-            ],
-
-            text_format=
-                RouteDecision,
-        )
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ],
+        text_format=RouteDecision,
     )
 
-
-    decision = (
-        response.output_parsed
-    )
-
+    decision = response.output_parsed
 
     if decision is None:
-
         raise Exception(
-            "OpenAI router returned "
-            "no structured decision."
+            "OpenAI router returned no structured decision."
         )
-
 
     return decision
 
 
 # ============================================================
-# CRM AGENT INSTRUCTIONS
+# AGENT CONFIG
 # ============================================================
 
-CRM_AGENT_INSTRUCTIONS = """
-You are an enterprise sales CRM assistant.
+AGENT_INSTRUCTIONS = """
+You are an enterprise sales CRM and research assistant.
 
-The user is authenticated through Microsoft Entra.
+Salesforce:
+- The user is authenticated through Microsoft Entra.
+- The backend authenticates to Salesforce as the corresponding Salesforce user.
+- Use Salesforce tools whenever the request depends on CRM data.
+- Never invent CRM records or fields.
+- Account billing/shipping addresses are customer/site address information.
+- Contact mailing addresses are contact-level addresses.
+- Opportunity contacts are represented by Opportunity Contact Roles.
+- Distinguish Salesforce facts from your interpretation.
 
-The backend authenticates to Salesforce as the corresponding
-Salesforce user.
+Web:
+- If this request was routed as needing web research, you MUST use web_search
+  before giving the final answer.
+- Prefer current, authoritative, first-party sources when available.
+- Do not claim a current public fact without web support.
+- Keep source attribution clear.
 
-You have read-only Salesforce tools.
+Writes:
+- The only write-capable tool is propose_update_opportunity.
+- It DOES NOT execute a write.
+- It only creates a pending action.
+- Never say Salesforce was updated until the backend confirmation endpoint
+  reports success.
+- If changes are pending, summarize exactly what would change and tell the
+  user explicit confirmation is required.
 
-Use a CRM tool whenever the user's request depends on CRM
-data.
-
-Do not answer CRM-specific questions from assumptions.
-
-Never invent:
-
-- opportunities
-- customers
-- contacts
-- addresses
-- amounts
-- stages
-- dates
-- phone numbers
-- emails
-- titles
-- Salesforce fields
-
-If Salesforce returns null or missing data, explicitly say
-that the information is not populated in Salesforce.
-
-Account billing addresses represent the primary customer
-billing/location information.
-
-Account shipping addresses can represent shipping or site
-information.
-
-Contact mailing addresses are contact-level addresses.
-
-Contacts associated with an Opportunity are represented
-through Opportunity Contact Roles.
-
-You may call multiple CRM tools if necessary.
-
-For analysis, distinguish Salesforce facts from your own
-interpretation.
-
-When assessing opportunity risk, consider available facts
-such as:
-
-- stage
-- amount
-- close date
-- probability
-- next step
-- forecast category
-- missing contact information
-- missing next step
-- customer information
-
-Do not invent a risk signal that Salesforce did not return.
-
-You currently have READ-ONLY access.
-
-There are no write tools.
-
-Never claim that you modified Salesforce.
+You may call multiple tools and combine Salesforce data with web research.
 """
 
 
-# ============================================================
-# CRM AGENT EXECUTION
-# ============================================================
+def model_and_effort_for_route(decision):
+    if decision.route == "crm_read":
+        return "gpt-5.6-luna", "low"
 
-def execute_crm_agent(
+    if decision.route == "crm_analysis":
+        effort = (
+            decision.reasoning_effort
+            if decision.reasoning_effort in {"medium", "high", "xhigh", "max"}
+            else "medium"
+        )
+        return "gpt-5.6-terra", effort
+
+    if decision.route == "web_simple":
+        return "gpt-5.6-terra", "medium"
+
+    if decision.route in {"web_research", "workflow"}:
+        return "gpt-5.6-terra", "high"
+
+    if decision.route == "deep_complex":
+        effort = (
+            decision.reasoning_effort
+            if decision.reasoning_effort in {"high", "xhigh", "max"}
+            else "high"
+        )
+        return "gpt-5.6-sol", effort
+
+    raise Exception(f"Execution not enabled for route: {decision.route}")
+
+
+def build_tools_for_decision(decision):
+    tools = []
+
+    if decision.needs_salesforce:
+        tools.extend(CRM_READ_TOOLS)
+
+    if decision.needs_write:
+        tools.extend(CRM_WRITE_TOOLS)
+
+    if decision.needs_web:
+        tools.append({"type": "web_search"})
+
+    return tools
+
+
+def collect_web_metadata(response):
+    dumped = response.model_dump()
+
+    used = False
+    searches = []
+    sources_by_url = {}
+
+    for item in dumped.get("output", []):
+        item_type = item.get("type")
+
+        if item_type == "web_search_call":
+            used = True
+            action = item.get("action") or {}
+
+            searches.append({
+                "type": action.get("type"),
+                "query": action.get("query"),
+                "queries": action.get("queries"),
+            })
+
+            for source in action.get("sources") or []:
+                url = source.get("url")
+                if url:
+                    sources_by_url[url] = {
+                        "title": source.get("title"),
+                        "url": url,
+                    }
+
+        if item_type == "message":
+            for content in item.get("content") or []:
+                for annotation in content.get("annotations") or []:
+                    if annotation.get("type") == "url_citation":
+                        url = annotation.get("url")
+                        if url:
+                            sources_by_url[url] = {
+                                "title": annotation.get("title"),
+                                "url": url,
+                            }
+
+    return {
+        "used": used,
+        "searches": searches,
+        "sources": list(sources_by_url.values()),
+    }
+
+
+def dedupe_pending_actions(actions):
+    unique = []
+    seen = set()
+
+    for action in actions:
+        key = (
+            action.get("opportunity_id"),
+            action.get("field_name"),
+            json.dumps(action.get("new_value"), sort_keys=True),
+        )
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(action)
+
+    return unique
+
+
+def create_confirmation_token(claims, salesforce_username, actions):
+    now = int(time.time())
+
+    payload = {
+        "iss": "cmd-ai-api",
+        "aud": "cmd-ai-write-confirmation",
+        "type": "salesforce_write_confirmation",
+        "oid": claims.get("oid"),
+        "tid": claims.get("tid"),
+        "salesforce_username": salesforce_username,
+        "actions": actions,
+        "iat": now,
+        "exp": now + 600,
+    }
+
+    return jwt.encode(
+        payload,
+        APP_SIGNING_SECRET,
+        algorithm="HS256",
+    )
+
+
+def execute_agent(
     user_message,
     decision,
     sf,
-    salesforce_username
+    salesforce_username,
+    claims,
 ):
-
-    # --------------------------------------------------------
-    # MODEL SAFETY FLOOR
-    # --------------------------------------------------------
-
-    if decision.route == "crm_read":
-
-        model = (
-            "gpt-5.6-luna"
-        )
-
-        effort = "low"
-
-
-    elif decision.route == "crm_analysis":
-
-        model = (
-            "gpt-5.6-terra"
-        )
-
-        # Router can choose medium/high.
-        # Keep at least medium for analysis.
-
-        if (
-            decision.reasoning_effort
-            in {
-                "high",
-                "xhigh",
-                "max"
-            }
-        ):
-
-            effort = (
-                decision
-                .reasoning_effort
-            )
-
-        else:
-
-            effort = "medium"
-
-
-    else:
-
-        raise Exception(
-            "This route is not enabled "
-            "for CRM execution."
-        )
-
-
-    # --------------------------------------------------------
-    # CONVERSATION INPUT
-    # --------------------------------------------------------
+    model, effort = model_and_effort_for_route(decision)
+    tools = build_tools_for_decision(decision)
 
     input_items = [
-
         {
-            "role":
-                "developer",
-
-            "content":
-                (
-                    CRM_AGENT_INSTRUCTIONS
-                    + "\n\nCurrent date: "
-                    + date.today().isoformat()
-                ),
+            "role": "developer",
+            "content": (
+                AGENT_INSTRUCTIONS
+                + "\n\nCurrent date: "
+                + date.today().isoformat()
+                + "\n\nRoute selected: "
+                + decision.route
+                + "\nWeb required: "
+                + str(decision.needs_web)
+                + "\nSalesforce required: "
+                + str(decision.needs_salesforce)
+                + "\nWrite requested: "
+                + str(decision.needs_write)
+            ),
         },
-
         {
-            "role":
-                "user",
-
-            "content":
-                user_message,
+            "role": "user",
+            "content": user_message,
         },
     ]
 
-
     tool_trace = []
+    pending_actions = []
+    all_web_sources = {}
+    web_search_trace = []
+    web_used = False
+    force_web_next_round = False
 
+    for round_number in range(1, 10):
+        current_tools = tools
+        tool_choice = "auto"
 
-    # --------------------------------------------------------
-    # MULTI-ROUND TOOL LOOP
-    # --------------------------------------------------------
+        if force_web_next_round:
+            current_tools = [{"type": "web_search"}]
+            tool_choice = "required"
+            force_web_next_round = False
+        elif round_number == 1 and decision.needs_web:
+            # Guarantees at least some tool work begins immediately.
+            # For web-only routes, the only available tool is web_search.
+            tool_choice = "required"
 
-    for round_number in range(
-        1,
-        7
-    ):
+        kwargs = {
+            "model": model,
+            "reasoning": {"effort": effort},
+            "tools": current_tools,
+            "tool_choice": tool_choice,
+            "input": input_items,
+            "store": False,
+        }
 
-        response = (
-            openai_client
-            .responses
-            .create(
+        if decision.needs_web:
+            kwargs["include"] = ["web_search_call.action.sources"]
 
-                model=model,
+        response = openai_client.responses.create(**kwargs)
 
-                reasoning={
-                    "effort":
-                        effort
-                },
+        web_meta = collect_web_metadata(response)
 
-                tools=
-                    CRM_READ_TOOLS,
+        if web_meta["used"]:
+            web_used = True
 
-                input=
-                    input_items,
+        web_search_trace.extend(web_meta["searches"])
 
-                store=False,
-            )
-        )
+        for source in web_meta["sources"]:
+            if source.get("url"):
+                all_web_sources[source["url"]] = source
 
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Preserve model output for next tool round,
-        # including reasoning/function-call items.
-        # ----------------------------------------------------
-
-        input_items += (
-            response.output
-        )
-
+        input_items += response.output
 
         function_calls = [
-
             item
-
-            for item
-            in response.output
-
-            if (
-                item.type
-                == "function_call"
-            )
+            for item in response.output
+            if item.type == "function_call"
         ]
 
-
-        # ----------------------------------------------------
-        # NO FUNCTIONS = MODEL IS FINISHED
-        # ----------------------------------------------------
-
         if not function_calls:
+            if decision.needs_web and not web_used:
+                input_items.append({
+                    "role": "developer",
+                    "content": (
+                        "The request requires current web research, but no web "
+                        "search has been performed yet. Perform web_search now "
+                        "before producing the final answer."
+                    ),
+                })
+                force_web_next_round = True
+                continue
 
-            answer = (
-                response.output_text
-                or ""
-            ).strip()
-
+            answer = (response.output_text or "").strip()
 
             if not answer:
-
-                answer = (
-                    "I couldn't produce a "
-                    "final answer from the "
-                    "available CRM data."
+                raise Exception(
+                    "Agent completed without a final text answer."
                 )
 
+            pending_actions = dedupe_pending_actions(pending_actions)
+
+            confirmation_token = None
+
+            if pending_actions:
+                confirmation_token = create_confirmation_token(
+                    claims,
+                    salesforce_username,
+                    pending_actions,
+                )
 
             return {
-
-                "answer":
-                    answer,
-
-                "execution_model":
-                    model,
-
-                "reasoning_effort":
-                    effort,
-
-                "tool_rounds":
-                    round_number - 1,
-
-                "tool_trace":
-                    tool_trace,
+                "answer": answer,
+                "execution_model": model,
+                "reasoning_effort": effort,
+                "tool_rounds": round_number - 1,
+                "tool_trace": tool_trace,
+                "web_used": web_used,
+                "web_search_trace": web_search_trace,
+                "web_sources": list(all_web_sources.values()),
+                "pending_actions": pending_actions,
+                "confirmation_required": bool(pending_actions),
+                "confirmation_token": confirmation_token,
             }
 
-
-        # ----------------------------------------------------
-        # EXECUTE TOOL CALLS
-        # ----------------------------------------------------
-
         for call in function_calls:
-
             try:
-
-                arguments = (
-                    json.loads(
-                        call.arguments
-                    )
-                )
-
+                arguments = json.loads(call.arguments)
             except Exception as e:
-
+                arguments = None
                 result = {
                     "ok": False,
-                    "error":
-                        (
-                            "Invalid tool "
-                            "arguments: "
-                            + str(e)
-                        )
+                    "error": f"Invalid tool arguments: {e}",
                 }
-
             else:
+                if sf is None:
+                    result = {
+                        "ok": False,
+                        "error": (
+                            "Salesforce tool requested, but Salesforce "
+                            "was not enabled for this route."
+                        ),
+                    }
+                else:
+                    result = run_function_tool(
+                        call.name,
+                        arguments,
+                        sf,
+                        salesforce_username,
+                    )
 
-                result = run_crm_tool(
-
-                    call.name,
-
-                    arguments,
-
-                    sf,
-
-                    salesforce_username
-                )
-
-
-            # -----------------------------------------------
-            # DEBUG TRACE
-            # -----------------------------------------------
+            if result.get("pending_action"):
+                pending_actions.append(result["pending_action"])
 
             tool_trace.append({
-
-                "round":
-                    round_number,
-
-                "tool":
-                    call.name,
-
-                "arguments":
-                    arguments
-                    if "arguments"
-                    in locals()
-                    else None,
-
-                "ok":
-                    result.get(
-                        "ok",
-                        False
-                    ),
-
-                "result_count":
-                    result.get(
-                        "count"
-                    ),
+                "round": round_number,
+                "tool": call.name,
+                "arguments": arguments,
+                "ok": result.get("ok", False),
+                "result_count": result.get("count"),
+                "status": result.get("status"),
             })
-
-
-            # -----------------------------------------------
-            # SEND TOOL RESULT BACK TO OPENAI
-            # -----------------------------------------------
 
             input_items.append({
-
-                "type":
-                    "function_call_output",
-
-                "call_id":
-                    call.call_id,
-
-                "output":
-                    json.dumps(
-                        result,
-                        default=str
-                    ),
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": json.dumps(result, default=str),
             })
 
-
     raise Exception(
-        "CRM agent exceeded the "
-        "maximum number of tool rounds."
+        "Agent exceeded the maximum number of tool rounds."
     )
 
 
 # ============================================================
-# ROUTE:
-# ROOT
+# WRITE CONFIRMATION
+# ============================================================
+
+def decode_confirmation_token(token):
+    return jwt.decode(
+        token,
+        APP_SIGNING_SECRET,
+        algorithms=["HS256"],
+        audience="cmd-ai-write-confirmation",
+        issuer="cmd-ai-api",
+    )
+
+
+def execute_confirmed_actions(claims, token_payload):
+    if token_payload.get("type") != "salesforce_write_confirmation":
+        raise ValueError("Invalid confirmation token type.")
+
+    if token_payload.get("oid") != claims.get("oid"):
+        raise ValueError(
+            "Confirmation token belongs to a different Entra user."
+        )
+
+    if token_payload.get("tid") != claims.get("tid"):
+        raise ValueError(
+            "Confirmation token belongs to a different Entra tenant."
+        )
+
+    salesforce_username = claims.get("preferred_username")
+
+    if (
+        not salesforce_username
+        or token_payload.get("salesforce_username") != salesforce_username
+    ):
+        raise ValueError(
+            "Confirmation token Salesforce identity does not match."
+        )
+
+    actions = token_payload.get("actions") or []
+
+    if not actions:
+        raise ValueError("No actions were found in the confirmation token.")
+
+    sf = get_salesforce_access_token(salesforce_username)
+
+    # First validate every action and check for stale data.
+    validated = []
+
+    for action in actions:
+        if action.get("action") != "update_opportunity":
+            raise ValueError("Unsupported confirmed action.")
+
+        field_name = action.get("field_name")
+        opportunity_id = action.get("opportunity_id")
+
+        new_value = normalize_opportunity_write_value(
+            field_name,
+            action.get("new_value"),
+        )
+
+        current = get_owned_opportunity_field(
+            sf,
+            salesforce_username,
+            opportunity_id,
+            field_name,
+        )
+
+        if not values_equivalent(
+            current["current_value"],
+            action.get("old_value"),
+        ):
+            raise ValueError(
+                f"Conflict: {current['name']} → {field_name} changed "
+                "after the proposal was created. No writes were executed."
+            )
+
+        validated.append({
+            "opportunity_id": current["id"],
+            "opportunity_name": current["name"],
+            "field_name": field_name,
+            "old_value": current["current_value"],
+            "new_value": new_value,
+        })
+
+    # PoC behavior: execute sequentially after all pre-checks pass.
+    results = []
+
+    for action in validated:
+        salesforce_update_opportunity(
+            sf["access_token"],
+            sf["instance_url"],
+            action["opportunity_id"],
+            {
+                action["field_name"]: action["new_value"]
+            },
+        )
+
+        results.append({
+            "opportunity_id": action["opportunity_id"],
+            "opportunity_name": action["opportunity_name"],
+            "field_name": action["field_name"],
+            "old_value": action["old_value"],
+            "new_value": action["new_value"],
+            "status": "updated",
+        })
+
+    return results
+
+
+# ============================================================
+# ROUTES
 # ============================================================
 
 @app.get("/")
 def root():
-
     return jsonify({
-
-        "service":
-            "CMD AI API",
-
-        "status":
-            "running",
-
-        "version":
-            "crm-agent-v1"
+        "service": "CMD AI API",
+        "status": "running",
+        "version": "web-write-agent-v1",
     })
 
-
-# ============================================================
-# ROUTE:
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health():
+    return jsonify({"ok": True})
 
-    return jsonify({
-        "ok": True
-    })
-
-
-# ============================================================
-# ROUTE:
-# MICROSOFT IDENTITY
-# ============================================================
 
 @app.get("/me")
 @require_auth
 def me():
-
-    claims = (
-        request.user_claims
-    )
+    claims = request.user_claims
 
     return jsonify({
-
-        "authenticated":
-            True,
-
-        "name":
-            claims.get("name"),
-
-        "username":
-            claims.get(
-                "preferred_username"
-            ),
-
-        "oid":
-            claims.get("oid"),
-
-        "tenant_id":
-            claims.get("tid"),
-
-        "scope":
-            claims.get("scp"),
-
-        "audience":
-            claims.get("aud"),
-
-        "token_version":
-            claims.get("ver"),
+        "authenticated": True,
+        "name": claims.get("name"),
+        "username": claims.get("preferred_username"),
+        "oid": claims.get("oid"),
+        "tenant_id": claims.get("tid"),
+        "scope": claims.get("scp"),
+        "audience": claims.get("aud"),
+        "token_version": claims.get("ver"),
     })
 
-
-# ============================================================
-# ROUTE:
-# SALESFORCE IDENTITY / CONNECTION TEST
-# ============================================================
 
 @app.get("/salesforce/me")
 @require_auth
 def salesforce_me():
+    claims = request.user_claims
+    salesforce_username = claims.get("preferred_username")
 
-    claims = (
-        request.user_claims
-    )
-
-    entra_username = (
-        claims.get(
-            "preferred_username"
-        )
-    )
-
-
-    if not entra_username:
-
+    if not salesforce_username:
         return jsonify({
-            "error":
-                "preferred_username_missing"
+            "error": "preferred_username_missing"
         }), 400
 
-
-    # --------------------------------------------------------
-    # CURRENT POC MAPPING:
-    #
-    # Entra preferred_username
-    # ==
-    # Salesforce Username
-    #
-    # Later replace this with tenant+oid mapping.
-    # --------------------------------------------------------
-
-    salesforce_username = (
-        entra_username
-    )
-
-
     try:
-
-        sf = (
-            get_salesforce_access_token(
-                salesforce_username
-            )
-        )
-
+        sf = get_salesforce_access_token(salesforce_username)
     except Exception as e:
-
         return jsonify({
-
-            "microsoft_authenticated":
-                True,
-
-            "salesforce_authenticated":
-                False,
-
-            "microsoft_username":
-                entra_username,
-
-            "salesforce_username":
-                salesforce_username,
-
-            "error":
-                str(e),
-
+            "microsoft_authenticated": True,
+            "salesforce_authenticated": False,
+            "microsoft_username": salesforce_username,
+            "salesforce_username": salesforce_username,
+            "error": str(e),
         }), 502
 
+    safe_username = soql_escape(salesforce_username)
 
-    # --------------------------------------------------------
-    # QUERY TEST
-    # --------------------------------------------------------
-
-    safe_username = (
-        soql_escape(
-            salesforce_username
-        )
+    soql = (
+        "SELECT Id, Name, StageName, Amount, CloseDate "
+        "FROM Opportunity "
+        f"WHERE Owner.Username = '{safe_username}' "
+        "ORDER BY CloseDate ASC "
+        "LIMIT 100"
     )
 
-
-    soql = f"""
-        SELECT
-            Id,
-            Name,
-            StageName,
-            Amount,
-            CloseDate
-        FROM Opportunity
-        WHERE Owner.Username = '{safe_username}'
-        ORDER BY CloseDate ASC
-        LIMIT 100
-    """
-
-
     try:
-
-        opportunity_data = (
-            salesforce_query(
-
-                sf[
-                    "access_token"
-                ],
-
-                sf[
-                    "instance_url"
-                ],
-
-                soql
-            )
+        data = salesforce_query(
+            sf["access_token"],
+            sf["instance_url"],
+            soql,
         )
-
     except Exception as e:
-
-        # Important distinction:
-        # Salesforce authentication itself worked,
-        # but the user's license/permissions may block
-        # Opportunity access — exactly what happened with Bob.
-
         return jsonify({
-
-            "microsoft_authenticated":
-                True,
-
-            "salesforce_authenticated":
-                True,
-
-            "salesforce_query_success":
-                False,
-
-            "microsoft_username":
-                entra_username,
-
-            "salesforce_username":
-                salesforce_username,
-
-            "error":
-                str(e),
-
+            "microsoft_authenticated": True,
+            "salesforce_authenticated": True,
+            "salesforce_query_success": False,
+            "microsoft_username": salesforce_username,
+            "salesforce_username": salesforce_username,
+            "error": str(e),
         }), 403
 
-
-    opportunities = []
-
-
-    for row in opportunity_data.get(
-        "records",
-        []
-    ):
-
-        opportunities.append({
-
-            "id":
-                row.get("Id"),
-
-            "name":
-                row.get("Name"),
-
-            "stage":
-                row.get(
-                    "StageName"
-                ),
-
-            "amount":
-                row.get("Amount"),
-
-            "close_date":
-                row.get(
-                    "CloseDate"
-                ),
-        })
-
+    opportunities = [
+        {
+            "id": row.get("Id"),
+            "name": row.get("Name"),
+            "stage": row.get("StageName"),
+            "amount": row.get("Amount"),
+            "close_date": row.get("CloseDate"),
+        }
+        for row in data.get("records", [])
+    ]
 
     return jsonify({
-
         "microsoft": {
-
-            "name":
-                claims.get(
-                    "name"
-                ),
-
-            "username":
-                entra_username,
-
-            "oid":
-                claims.get(
-                    "oid"
-                ),
-
-            "tenant_id":
-                claims.get(
-                    "tid"
-                ),
+            "name": claims.get("name"),
+            "username": salesforce_username,
+            "oid": claims.get("oid"),
+            "tenant_id": claims.get("tid"),
         },
-
         "salesforce": {
-
-            "connected":
-                True,
-
-            "username":
-                salesforce_username,
-
-            "instance":
-                sf[
-                    "instance_url"
-                ],
+            "connected": True,
+            "username": salesforce_username,
+            "instance": sf["instance_url"],
         },
-
-        "opportunity_count":
-            len(
-                opportunities
-            ),
-
-        "opportunities":
-            opportunities,
+        "opportunity_count": len(opportunities),
+        "opportunities": opportunities,
     })
 
-
-# ============================================================
-# ROUTE:
-# AI CHAT
-# ============================================================
 
 @app.post("/chat")
 @require_auth
 def chat():
-
-    body = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
-
-
-    user_message = (
-        body.get("message")
-        or ""
-    ).strip()
-
+    body = request.get_json(silent=True) or {}
+    user_message = (body.get("message") or "").strip()
 
     if not user_message:
+        return jsonify({"error": "message_required"}), 400
 
-        return jsonify({
-            "error":
-                "message_required"
-        }), 400
-
-
-    claims = (
-        request.user_claims
-    )
-
-
-    salesforce_username = (
-        claims.get(
-            "preferred_username"
-        )
-    )
-
+    claims = request.user_claims
+    salesforce_username = claims.get("preferred_username")
 
     if not salesforce_username:
-
         return jsonify({
-            "error":
-                "preferred_username_missing"
+            "error": "preferred_username_missing"
         }), 400
 
-
     try:
+        # Stage 1: cheap Luna router.
+        decision = route_or_answer(user_message)
+        route_data = decision.model_dump()
 
-        # ====================================================
-        # STAGE 1:
-        # LUNA LOW ROUTER
-        # ====================================================
-
-        decision = (
-            route_or_answer(
-                user_message
-            )
-        )
-
-
-        route_data = (
-            decision.model_dump()
-        )
-
-
-        # ====================================================
-        # SIMPLE QUESTION
-        #
-        # Luna already produced the answer.
-        # ====================================================
-
-        if (
-            decision.action
-            == "answer"
-        ):
-
+        # Simple answer already completed by router.
+        if decision.action == "answer":
             return jsonify({
-
-                "status":
-                    "answered",
-
-                "user":
-                    salesforce_username,
-
-                "router_model":
-                    "gpt-5.6-luna",
-
-                "route":
-                    route_data,
-
-                "execution_model":
-                    "gpt-5.6-luna",
-
-                "answer":
-                    decision.answer,
-
-                "tool_trace":
-                    [],
+                "status": "answered",
+                "user": salesforce_username,
+                "router_model": "gpt-5.6-luna",
+                "route": route_data,
+                "execution_model": "gpt-5.6-luna",
+                "answer": decision.answer,
+                "tool_trace": [],
+                "web_used": False,
+                "web_sources": [],
+                "pending_actions": [],
+                "confirmation_required": False,
             })
 
+        sf = None
 
-        # ====================================================
-        # CRM READ / CRM ANALYSIS
-        # ====================================================
-
-        if decision.route in {
-
-            "crm_read",
-            "crm_analysis"
-
-        }:
-
-            # -----------------------------------------------
-            # Authenticate to Salesforce AS THIS USER
-            # -----------------------------------------------
-
-            sf = (
-                get_salesforce_access_token(
-                    salesforce_username
-                )
+        if decision.needs_salesforce:
+            sf = get_salesforce_access_token(
+                salesforce_username
             )
 
+        result = execute_agent(
+            user_message,
+            decision,
+            sf,
+            salesforce_username,
+            claims,
+        )
 
-            # -----------------------------------------------
-            # EXECUTE AGENT
-            # -----------------------------------------------
+        response_body = {
+            "status": (
+                "confirmation_required"
+                if result["confirmation_required"]
+                else "answered"
+            ),
+            "user": salesforce_username,
+            "router_model": "gpt-5.6-luna",
+            "route": route_data,
+            "execution_model": result["execution_model"],
+            "execution_effort": result["reasoning_effort"],
+            "tool_rounds": result["tool_rounds"],
+            "tool_trace": result["tool_trace"],
+            "web_used": result["web_used"],
+            "web_search_trace": result["web_search_trace"],
+            "web_sources": result["web_sources"],
+            "pending_actions": result["pending_actions"],
+            "confirmation_required": result["confirmation_required"],
+            "answer": result["answer"],
+        }
 
-            result = (
-                execute_crm_agent(
-
-                    user_message,
-
-                    decision,
-
-                    sf,
-
-                    salesforce_username
-                )
+        if result["confirmation_token"]:
+            response_body["confirmation_token"] = (
+                result["confirmation_token"]
             )
 
-
-            return jsonify({
-
-                "status":
-                    "answered",
-
-                "user":
-                    salesforce_username,
-
-                "router_model":
-                    "gpt-5.6-luna",
-
-                "route":
-                    route_data,
-
-                "execution_model":
-                    result[
-                        "execution_model"
-                    ],
-
-                "execution_effort":
-                    result[
-                        "reasoning_effort"
-                    ],
-
-                "tool_rounds":
-                    result[
-                        "tool_rounds"
-                    ],
-
-                "tool_trace":
-                    result[
-                        "tool_trace"
-                    ],
-
-                "answer":
-                    result[
-                        "answer"
-                    ],
-            })
-
-
-        # ====================================================
-        # FUTURE ROUTES
-        #
-        # Router understands these but execution isn't
-        # connected yet.
-        # ====================================================
-
-        return jsonify({
-
-            "status":
-                "routed",
-
-            "user":
-                salesforce_username,
-
-            "router_model":
-                "gpt-5.6-luna",
-
-            "route":
-                route_data,
-
-            "message":
-                (
-                    "The router selected this "
-                    "capability correctly, but "
-                    "execution for this route "
-                    "is not enabled yet."
-                ),
-        })
-
+        return jsonify(response_body)
 
     except Exception as e:
-
         return jsonify({
-
-            "error":
-                "chat_failed",
-
-            "details":
-                str(e),
-
+            "error": "chat_failed",
+            "details": str(e),
         }), 500
 
 
+@app.post("/confirm")
+@require_auth
+def confirm():
+    body = request.get_json(silent=True) or {}
+    confirmation_token = body.get("confirmation_token")
+
+    if not confirmation_token:
+        return jsonify({
+            "error": "confirmation_token_required"
+        }), 400
+
+    try:
+        payload = decode_confirmation_token(
+            confirmation_token
+        )
+
+        results = execute_confirmed_actions(
+            request.user_claims,
+            payload,
+        )
+
+        return jsonify({
+            "status": "confirmed",
+            "updated_count": len(results),
+            "results": results,
+        })
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({
+            "error": "confirmation_expired",
+            "details": (
+                "The write confirmation expired. "
+                "Ask the assistant to prepare the changes again."
+            ),
+        }), 400
+
+    except Exception as e:
+        return jsonify({
+            "error": "confirmation_failed",
+            "details": str(e),
+        }), 400
+
+
 # ============================================================
-# LOCAL DEVELOPMENT
+# LOCAL DEV
 # ============================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=True
+        debug=True,
     )
