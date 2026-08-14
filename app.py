@@ -34,10 +34,10 @@ entra_jwks_client = PyJWKClient(ENTRA_JWKS_URL)
 # SALESFORCE CONFIG
 # ============================================================
 
-SF_CONSUMER_KEY = os.environ["SF_CONSUMER_KEY"]
+SF_CLIENT_ID = os.environ["SF_CLIENT_ID"]
 
-SF_MY_DOMAIN_URL = (
-    os.environ["SF_MY_DOMAIN_URL"].rstrip("/")
+SF_LOGIN_URL = (
+    os.environ["SF_LOGIN_URL"].rstrip("/")
 )
 
 SF_JWT_AUDIENCE = os.environ.get(
