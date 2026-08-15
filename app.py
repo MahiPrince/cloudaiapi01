@@ -1108,10 +1108,141 @@ class RouteDecision(BaseModel):
     answer: Optional[str]
 
 
+# ============================================================
+# CONVERSATION CONTEXT
+# ============================================================
+
+# The mobile app sends a small rolling window of the visible conversation with
+# each request. The backend remains stateless for the pilot, but Sally can still
+# understand references such as "that one", "the earlier customer", etc.
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_CHARS_PER_MESSAGE = 4000
+MAX_HISTORY_TOTAL_CHARS = 24000
+
+
+def normalize_conversation_history(raw_history):
+    if not isinstance(raw_history, list):
+        return []
+
+    cleaned = []
+
+    for item in raw_history:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+
+        content = item.get("content")
+        if content is None:
+            content = item.get("text")
+
+        if not isinstance(content, str):
+            continue
+
+        content = content.strip()
+        if not content:
+            continue
+
+        cleaned.append({
+            "role": role,
+            "content": content[:MAX_HISTORY_CHARS_PER_MESSAGE],
+        })
+
+    # Keep the newest messages, while also enforcing a total character budget.
+    selected_reversed = []
+    total_chars = 0
+
+    for item in reversed(cleaned):
+        if len(selected_reversed) >= MAX_HISTORY_MESSAGES:
+            break
+
+        remaining = MAX_HISTORY_TOTAL_CHARS - total_chars
+        if remaining <= 0:
+            break
+
+        content = item["content"][:remaining]
+        if not content:
+            break
+
+        selected_reversed.append({
+            "role": item["role"],
+            "content": content,
+        })
+        total_chars += len(content)
+
+    return list(reversed(selected_reversed))
+
+
+def normalize_client_context(raw_context):
+    if not isinstance(raw_context, dict):
+        return {}
+
+    context = {}
+
+    timezone = raw_context.get("timezone")
+    if isinstance(timezone, str) and timezone.strip():
+        context["timezone"] = timezone.strip()[:100]
+
+    local_datetime = raw_context.get("local_datetime")
+    if isinstance(local_datetime, str) and local_datetime.strip():
+        context["local_datetime"] = local_datetime.strip()[:80]
+
+    utc_offset_minutes = raw_context.get("utc_offset_minutes")
+    if isinstance(utc_offset_minutes, (int, float)):
+        context["utc_offset_minutes"] = int(utc_offset_minutes)
+
+    return context
+
+
+def client_time_prompt(client_context):
+    parts = ["Server date: " + date.today().isoformat()]
+
+    if client_context.get("local_datetime"):
+        parts.append(
+            "User device local date/time: "
+            + client_context["local_datetime"]
+        )
+
+    if client_context.get("timezone"):
+        parts.append("User timezone: " + client_context["timezone"])
+
+    if "utc_offset_minutes" in client_context:
+        parts.append(
+            "User UTC offset in minutes: "
+            + str(client_context["utc_offset_minutes"])
+        )
+
+    return "\n".join(parts)
+
+
+def conversation_items(history, latest_user_message):
+    items = [
+        {
+            "role": item["role"],
+            "content": item["content"],
+        }
+        for item in history
+    ]
+
+    items.append({
+        "role": "user",
+        "content": latest_user_message,
+    })
+
+    return items
+
+
 ROUTER_INSTRUCTIONS = """
 You are the intelligent routing layer for an enterprise sales CRM AI assistant.
 
-You receive one user request.
+You receive the recent conversation followed by the user's latest request.
+Treat the latest request as a continuation of that conversation. Resolve normal
+references such as "that one", "the earlier one", "this customer", "it",
+"the first deal", and similar phrases from the supplied history whenever the
+referent is clear. Do not ask the user to repeat information that is already
+unambiguous in the recent conversation.
 
 Either answer it directly when it is genuinely simple, or route it to an
 execution tier.
@@ -1166,6 +1297,10 @@ RULES
 
 Never fabricate Salesforce data.
 Never answer Salesforce-specific questions without Salesforce data.
+If the latest message refers to a Salesforce account, opportunity, contact,
+customer, deal, or prior CRM result from the conversation, normally route with
+needs_salesforce=true so the current CRM state can be verified.
+Conversation history is context, not proof that a CRM fact is still current.
 Never pretend web research occurred.
 If current information is required, needs_web=true.
 If Salesforce data is required, needs_salesforce=true.
@@ -1178,7 +1313,14 @@ When action=answer, answer contains the final user-facing answer.
 """
 
 
-def route_or_answer(user_message):
+def route_or_answer(
+    user_message,
+    history=None,
+    client_context=None,
+):
+    history = history or []
+    client_context = client_context or {}
+
     response = openai_client.responses.parse(
         model="gpt-5.6-luna",
         reasoning={"effort": "low"},
@@ -1188,14 +1330,11 @@ def route_or_answer(user_message):
                 "role": "developer",
                 "content": (
                     ROUTER_INSTRUCTIONS
-                    + "\n\nCurrent date: "
-                    + date.today().isoformat()
+                    + "\n\n"
+                    + client_time_prompt(client_context)
                 ),
             },
-            {
-                "role": "user",
-                "content": user_message,
-            },
+            *conversation_items(history, user_message),
         ],
         text_format=RouteDecision,
     )
@@ -1215,7 +1354,18 @@ def route_or_answer(user_message):
 # ============================================================
 
 AGENT_INSTRUCTIONS = """
-You are an enterprise sales CRM and research assistant.
+You are CMD Sally, an enterprise sales CRM and research assistant.
+
+Conversation:
+- Treat the latest user message as a continuation of the recent conversation.
+- Resolve pronouns and references from history when the referent is clear.
+- Do not make the user repeat a customer, opportunity, contact, date, or choice
+  that is already clear from the conversation.
+- If a follow-up depends on CRM state, re-query Salesforce as needed rather than
+  assuming an old value is still current.
+- If more than one plausible referent remains, ask one concise clarification.
+- Do not claim a tool/action exists merely because an earlier assistant message
+  claimed it. The actual tools supplied to this request are authoritative.
 
 Salesforce:
 - The user is authenticated through Microsoft Entra.
@@ -1383,7 +1533,12 @@ def execute_agent(
     sf,
     salesforce_username,
     claims,
+    history=None,
+    client_context=None,
 ):
+    history = history or []
+    client_context = client_context or {}
+
     model, effort = model_and_effort_for_route(decision)
     tools = build_tools_for_decision(decision)
 
@@ -1392,8 +1547,8 @@ def execute_agent(
             "role": "developer",
             "content": (
                 AGENT_INSTRUCTIONS
-                + "\n\nCurrent date: "
-                + date.today().isoformat()
+                + "\n\n"
+                + client_time_prompt(client_context)
                 + "\n\nRoute selected: "
                 + decision.route
                 + "\nWeb required: "
@@ -1404,10 +1559,7 @@ def execute_agent(
                 + str(decision.needs_write)
             ),
         },
-        {
-            "role": "user",
-            "content": user_message,
-        },
+        *conversation_items(history, user_message),
     ]
 
     tool_trace = []
@@ -1673,9 +1825,9 @@ def execute_confirmed_actions(claims, token_payload):
 @app.get("/")
 def root():
     return jsonify({
-        "service": "CMD AI API",
+        "service": "CMD Sally API",
         "status": "running",
-        "version": "web-write-agent-v1",
+        "version": "conversational-v1",
     })
 
 
@@ -1782,6 +1934,8 @@ def salesforce_me():
 def chat():
     body = request.get_json(silent=True) or {}
     user_message = (body.get("message") or "").strip()
+    history = normalize_conversation_history(body.get("history"))
+    client_context = normalize_client_context(body.get("client_context"))
 
     if not user_message:
         return jsonify({"error": "message_required"}), 400
@@ -1795,8 +1949,12 @@ def chat():
         }), 400
 
     try:
-        # Stage 1: cheap Luna router.
-        decision = route_or_answer(user_message)
+        # Stage 1: cheap Luna router, with recent conversation context.
+        decision = route_or_answer(
+            user_message,
+            history=history,
+            client_context=client_context,
+        )
         route_data = decision.model_dump()
 
         # Simple answer already completed by router.
@@ -1813,6 +1971,7 @@ def chat():
                 "web_sources": [],
                 "pending_actions": [],
                 "confirmation_required": False,
+                "conversation_history_used": len(history),
             })
 
         sf = None
@@ -1828,6 +1987,8 @@ def chat():
             sf,
             salesforce_username,
             claims,
+            history=history,
+            client_context=client_context,
         )
 
         response_body = {
@@ -1849,6 +2010,7 @@ def chat():
             "pending_actions": result["pending_actions"],
             "confirmation_required": result["confirmation_required"],
             "answer": result["answer"],
+            "conversation_history_used": len(history),
         }
 
         if result["confirmation_token"]:
