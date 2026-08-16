@@ -2,16 +2,24 @@ import os
 import json
 import re
 import time
+import math
+import hashlib
+import sqlite3
+import threading
+import uuid
+import subprocess
+from pathlib import Path
 from datetime import date, datetime, timezone
 from functools import wraps
 from typing import Literal, Optional
 
 import jwt
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from jwt import PyJWKClient
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import imageio_ffmpeg
 
 
 # ============================================================
@@ -19,6 +27,7 @@ from pydantic import BaseModel
 # ============================================================
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
 # ============================================================
@@ -43,7 +52,169 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 # Generate a long random value and keep it only in Render.
 APP_SIGNING_SECRET = os.environ["APP_SIGNING_SECRET"]
 
+# CMD Sally V3 pilot: location + Sessions.
+DEMO_GEO_ENABLED = os.environ.get("DEMO_GEO_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+DEMO_GEO_REAL_RADIUS_KM = float(os.environ.get("DEMO_GEO_REAL_RADIUS_KM", "250"))
+SESSION_STORAGE_ROOT = Path(os.environ.get("SESSION_STORAGE_ROOT", "/var/data/cmd-sally"))
+SESSION_AUTO_LINK_THRESHOLD = float(os.environ.get("SESSION_AUTO_LINK_THRESHOLD", "0.82"))
+MAX_OPENAI_AUDIO_BYTES = 24_000_000  # leave headroom below the 25 MB API ceiling
+SESSION_CHUNK_SECONDS = int(os.environ.get("SESSION_CHUNK_SECONDS", "1200"))
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ============================================================
+# SESSION STORAGE + SQLITE (PILOT)
+# ============================================================
+
+
+def _ensure_session_storage():
+    global SESSION_STORAGE_ROOT
+    try:
+        SESSION_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = SESSION_STORAGE_ROOT / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception:
+        # Local/dev safety fallback. On Render, attach a Persistent Disk at
+        # /var/data and keep SESSION_STORAGE_ROOT=/var/data/cmd-sally.
+        SESSION_STORAGE_ROOT = Path("/tmp/cmd-sally")
+        SESSION_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_session_storage()
+SESSION_DB_PATH = SESSION_STORAGE_ROOT / "sessions.db"
+SESSION_AUDIO_ROOT = SESSION_STORAGE_ROOT / "sessions"
+SESSION_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def session_db():
+    conn = sqlite3.connect(str(SESSION_DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_session_db():
+    with session_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                owner_oid TEXT NOT NULL,
+                salesforce_username TEXT NOT NULL,
+                title TEXT,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                duration_ms INTEGER,
+                audio_path TEXT,
+                audio_bytes INTEGER,
+                transcript_json_path TEXT,
+                transcript_text_path TEXT,
+                summary_json_path TEXT,
+                linked_opportunity_id TEXT,
+                linked_opportunity_name TEXT,
+                link_confidence REAL,
+                suggested_opportunity_id TEXT,
+                suggested_opportunity_name TEXT,
+                suggested_confidence REAL,
+                link_reason TEXT,
+                actual_location_json TEXT,
+                effective_location_json TEXT,
+                voicepuck_json TEXT,
+                processing_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+init_session_db()
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_session_id(value):
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,96}", raw):
+        raise ValueError("Invalid session id.")
+    return raw
+
+
+def owner_session_row(session_id, owner_oid):
+    with session_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND owner_oid = ?",
+            (safe_session_id(session_id), str(owner_oid)),
+        ).fetchone()
+    if not row:
+        raise ValueError("Session not found for the authenticated user.")
+    return row
+
+
+def read_json_file(path_value, default=None):
+    if not path_value:
+        return default
+    try:
+        return json.loads(Path(path_value).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def session_row_to_dict(row, include_summary=True):
+    data = dict(row)
+    summary = read_json_file(data.get("summary_json_path"), {}) if include_summary else None
+    actual_location = json.loads(data.get("actual_location_json") or "null")
+    effective_location = json.loads(data.get("effective_location_json") or "null")
+    voicepuck = json.loads(data.get("voicepuck_json") or "null") or {
+        "assigned": False,
+        "connected": False,
+        "device_id": None,
+    }
+
+    result = {
+        "session_id": data.get("session_id"),
+        "title": data.get("title") or "Untitled session",
+        "status": data.get("status"),
+        "source": data.get("source"),
+        "started_at": data.get("started_at"),
+        "ended_at": data.get("ended_at"),
+        "duration_ms": data.get("duration_ms"),
+        "audio_bytes": data.get("audio_bytes"),
+        "has_audio": bool(data.get("audio_path")),
+        "has_transcript": bool(data.get("transcript_json_path")),
+        "actual_location": actual_location,
+        "effective_location": effective_location,
+        "voicepuck": voicepuck,
+        "processing_error": data.get("processing_error"),
+        "linked_opportunity": (
+            {
+                "id": data.get("linked_opportunity_id"),
+                "name": data.get("linked_opportunity_name"),
+                "confidence": data.get("link_confidence"),
+            }
+            if data.get("linked_opportunity_id") else None
+        ),
+        "suggested_opportunity": (
+            {
+                "id": data.get("suggested_opportunity_id"),
+                "name": data.get("suggested_opportunity_name"),
+                "confidence": data.get("suggested_confidence"),
+                "reason": data.get("link_reason"),
+            }
+            if data.get("suggested_opportunity_id") else None
+        ),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+    }
+    if include_summary:
+        result["summary"] = summary or None
+    return result
 
 
 # ============================================================
@@ -411,6 +582,295 @@ def format_contact(contact):
         },
 
         "account": format_account(contact.get("Account")),
+    }
+
+
+# ============================================================
+# LOCATION + DEMO GEOGRAPHY ADAPTER
+# ============================================================
+
+# Demo fallback centers. When Salesforce Accounts have coordinates, those are
+# preferred and these centers are used only to group/select a useful territory.
+DEMO_GEO_CENTERS = [
+    {"key": "dallas", "label": "Dallas, TX", "latitude": 32.7767, "longitude": -96.7970},
+    {"key": "chicago", "label": "Chicago, IL", "latitude": 41.8781, "longitude": -87.6298},
+    {"key": "boston", "label": "Boston, MA", "latitude": 42.3601, "longitude": -71.0589},
+    {"key": "sf", "label": "San Francisco, CA", "latitude": 37.7749, "longitude": -122.4194},
+]
+
+DEMO_CITY_COORDS = {
+    ("dallas", "tx"): (32.7767, -96.7970),
+    ("austin", "tx"): (30.2672, -97.7431),
+    ("houston", "tx"): (29.7604, -95.3698),
+    ("chicago", "il"): (41.8781, -87.6298),
+    ("boston", "ma"): (42.3601, -71.0589),
+    ("cambridge", "ma"): (42.3736, -71.1097),
+    ("waltham", "ma"): (42.3765, -71.2356),
+    ("san francisco", "ca"): (37.7749, -122.4194),
+    ("san diego", "ca"): (32.7157, -117.1611),
+    ("los angeles", "ca"): (34.0522, -118.2437),
+}
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    radius = 6371.0088
+    p1 = math.radians(float(lat1))
+    p2 = math.radians(float(lat2))
+    dp = math.radians(float(lat2) - float(lat1))
+    dl = math.radians(float(lon2) - float(lon1))
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def account_coordinates(account):
+    if not account:
+        return None
+    for key in ("billing_address", "shipping_address"):
+        address = account.get(key) or {}
+        lat = address.get("latitude")
+        lon = address.get("longitude")
+        if lat is not None and lon is not None:
+            try:
+                return float(lat), float(lon)
+            except Exception:
+                pass
+
+    for key in ("billing_address", "shipping_address"):
+        address = account.get(key) or {}
+        city = str(address.get("city") or "").strip().lower()
+        state = str(address.get("state") or "").strip().lower()
+        if (city, state) in DEMO_CITY_COORDS:
+            return DEMO_CITY_COORDS[(city, state)]
+    return None
+
+
+def location_label(location):
+    if not location:
+        return None
+    city = str(location.get("city") or "").strip()
+    region = str(location.get("region") or location.get("state") or "").strip()
+    country = str(location.get("country") or "").strip()
+    return ", ".join([x for x in (city, region, country) if x]) or None
+
+
+def get_scoped_account_geo_rows(sf, salesforce_username):
+    result = tool_search_opportunities(
+        sf,
+        salesforce_username,
+        {
+            "name_contains": None,
+            "account_name_contains": None,
+            "status": "open",
+            "stage": None,
+            "min_amount": None,
+            "max_amount": None,
+            "close_date_from": None,
+            "close_date_to": None,
+            "account_city": None,
+            "account_state": None,
+            "account_country": None,
+            "include_contacts": False,
+            "limit": 100,
+        },
+    )
+    seen = {}
+    for opp in result.get("opportunities", []):
+        account = opp.get("account") or {}
+        account_id = account.get("id")
+        coords = account_coordinates(account)
+        if not account_id or not coords:
+            continue
+        if account_id not in seen:
+            seen[account_id] = {"account": account, "coords": coords}
+    return list(seen.values())
+
+
+def choose_demo_cluster(account_rows, stable_key):
+    populated = {}
+    for row in account_rows:
+        lat, lon = row["coords"]
+        center = min(
+            DEMO_GEO_CENTERS,
+            key=lambda c: haversine_km(lat, lon, c["latitude"], c["longitude"]),
+        )
+        populated.setdefault(center["key"], {"center": center, "rows": []})["rows"].append(row)
+
+    clusters = sorted(populated.values(), key=lambda c: c["center"]["key"])
+    if not clusters:
+        clusters = [{"center": center, "rows": []} for center in DEMO_GEO_CENTERS]
+
+    digest = hashlib.sha256(str(stable_key or "cmd-sally-demo").encode("utf-8")).digest()
+    chosen = clusters[int.from_bytes(digest[:4], "big") % len(clusters)]
+
+    if chosen["rows"]:
+        lat = sum(r["coords"][0] for r in chosen["rows"]) / len(chosen["rows"])
+        lon = sum(r["coords"][1] for r in chosen["rows"]) / len(chosen["rows"])
+    else:
+        lat = chosen["center"]["latitude"]
+        lon = chosen["center"]["longitude"]
+
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "label": chosen["center"]["label"],
+        "cluster": chosen["center"]["key"],
+    }
+
+
+def resolve_location_context(sf, salesforce_username, client_context, claims=None):
+    raw = (client_context or {}).get("location") or {}
+    try:
+        actual_lat = float(raw.get("latitude"))
+        actual_lon = float(raw.get("longitude"))
+    except Exception:
+        return None
+
+    actual = {
+        "latitude": actual_lat,
+        "longitude": actual_lon,
+        "accuracy_m": raw.get("accuracy_m"),
+        "city": raw.get("city"),
+        "region": raw.get("region"),
+        "country": raw.get("country"),
+        "iso_country_code": raw.get("iso_country_code"),
+        "label": location_label(raw),
+        "captured_at": raw.get("captured_at"),
+    }
+
+    account_rows = get_scoped_account_geo_rows(sf, salesforce_username)
+    nearest_distance = None
+    if account_rows:
+        nearest_distance = min(
+            haversine_km(actual_lat, actual_lon, row["coords"][0], row["coords"][1])
+            for row in account_rows
+        )
+
+    use_demo = bool(DEMO_GEO_ENABLED and (nearest_distance is None or nearest_distance > DEMO_GEO_REAL_RADIUS_KM))
+    if use_demo:
+        stable_key = (client_context or {}).get("geo_session_id") or (claims or {}).get("oid") or salesforce_username
+        effective = choose_demo_cluster(account_rows, stable_key)
+        effective["country"] = "USA"
+        mode = "demo"
+    else:
+        effective = {
+            "latitude": actual_lat,
+            "longitude": actual_lon,
+            "label": actual.get("label") or "Current location",
+            "country": actual.get("country"),
+        }
+        mode = "real"
+
+    return {
+        "mode": mode,
+        "demo_enabled": DEMO_GEO_ENABLED,
+        "actual": actual,
+        "effective": effective,
+        "nearest_scoped_account_km_from_actual": (
+            round(nearest_distance, 1) if nearest_distance is not None else None
+        ),
+    }
+
+
+def location_prompt(location_context):
+    if not location_context:
+        return "No current device location is available."
+    actual = location_context.get("actual") or {}
+    effective = location_context.get("effective") or {}
+    return (
+        "Location context for this request:\n"
+        f"- mode: {location_context.get('mode')}\n"
+        f"- actual device location: {actual.get('label') or (str(actual.get('latitude')) + ', ' + str(actual.get('longitude')))}\n"
+        f"- effective CRM location: {effective.get('label') or (str(effective.get('latitude')) + ', ' + str(effective.get('longitude')))}\n"
+        "Use the effective CRM location for nearby-account/customer workflows. "
+        "If mode=demo, be transparent that the CRM geography is a demo translation."
+    )
+
+
+def tool_find_nearby_accounts(sf, salesforce_username, args, location_context):
+    if not location_context or not (location_context.get("effective") or {}).get("latitude"):
+        return {"ok": False, "error": "No usable device/effective location is available."}
+
+    radius_km = float(args.get("radius_km") or 50)
+    radius_km = max(1.0, min(radius_km, 300.0))
+    limit = clamp_limit(args.get("limit"), default=10, maximum=25)
+    effective = location_context["effective"]
+
+    opp_result = tool_search_opportunities(
+        sf,
+        salesforce_username,
+        {
+            "name_contains": None,
+            "account_name_contains": None,
+            "status": "open",
+            "stage": None,
+            "min_amount": None,
+            "max_amount": None,
+            "close_date_from": None,
+            "close_date_to": None,
+            "account_city": None,
+            "account_state": None,
+            "account_country": None,
+            "include_contacts": True,
+            "limit": 100,
+        },
+    )
+
+    grouped = {}
+    for opp in opp_result.get("opportunities", []):
+        account = opp.get("account") or {}
+        account_id = account.get("id")
+        coords = account_coordinates(account)
+        if not account_id or not coords:
+            continue
+        distance = haversine_km(effective["latitude"], effective["longitude"], coords[0], coords[1])
+        if distance > radius_km:
+            continue
+
+        bucket = grouped.setdefault(account_id, {
+            "account": account,
+            "distance_km": distance,
+            "open_pipeline": 0.0,
+            "opportunities": [],
+            "contacts": [],
+        })
+        bucket["distance_km"] = min(bucket["distance_km"], distance)
+        bucket["open_pipeline"] += float(opp.get("amount") or 0)
+        bucket["opportunities"].append({
+            "id": opp.get("id"),
+            "name": opp.get("name"),
+            "stage": opp.get("stage"),
+            "amount": opp.get("amount"),
+            "close_date": opp.get("close_date"),
+            "next_step": opp.get("next_step"),
+        })
+        for role in opp.get("contacts") or []:
+            contact = role.get("contact") or {}
+            if contact.get("id") and not any(c.get("id") == contact.get("id") for c in bucket["contacts"]):
+                bucket["contacts"].append({
+                    "id": contact.get("id"),
+                    "name": contact.get("name"),
+                    "title": contact.get("title"),
+                    "phone": contact.get("mobile") or contact.get("phone"),
+                    "email": contact.get("email"),
+                    "role": role.get("role"),
+                    "is_primary": role.get("is_primary"),
+                })
+
+    rows = list(grouped.values())
+    for row in rows:
+        row["distance_km"] = round(row["distance_km"], 1)
+        row["distance_miles"] = round(row["distance_km"] * 0.621371, 1)
+        row["opportunities"].sort(key=lambda o: -(float(o.get("amount") or 0)))
+        row["top_opportunity"] = row["opportunities"][0] if row["opportunities"] else None
+    rows.sort(key=lambda r: (r["distance_km"], -r["open_pipeline"]))
+    rows = rows[:limit]
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "radius_km": radius_km,
+        "location_context": location_context,
+        "nearby_accounts": rows,
     }
 
 
@@ -1458,6 +1918,26 @@ CRM_READ_TOOLS = [
     },
     {
         "type": "function",
+        "name": "find_nearby_accounts",
+        "description": (
+            "Find customer Accounts with open opportunities near the user's effective current location. "
+            "The backend performs deterministic distance calculations; do not invent geography. "
+            "Use this for nearby customers, unplanned field visits, or a cancelled-meeting recovery workflow."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "radius_km": {"type": "number", "minimum": 1, "maximum": 300},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 25}
+            },
+            "required": ["radius_km", "limit"],
+            "additionalProperties": False
+        }
+    },
+
+    {
+        "type": "function",
         "name": "search_events",
         "description": (
             "Search Salesforce Events owned by the authenticated user. Use this "
@@ -1628,6 +2108,7 @@ def run_function_tool(
     arguments,
     sf,
     salesforce_username,
+    runtime_context=None,
 ):
     try:
         if tool_name == "search_opportunities":
@@ -1649,6 +2130,14 @@ def run_function_tool(
                 sf,
                 salesforce_username,
                 arguments,
+            )
+
+        if tool_name == "find_nearby_accounts":
+            return tool_find_nearby_accounts(
+                sf,
+                salesforce_username,
+                arguments,
+                (runtime_context or {}).get("location_context"),
             )
 
         if tool_name == "search_events":
@@ -1708,6 +2197,18 @@ CAPABILITY_MANIFEST = {
         "send_email": False,
     },
     "web_research": True,
+    "location": {
+        "foreground_gps": True,
+        "demo_geography_adapter": True,
+        "nearby_accounts": True
+    },
+    "sessions": {
+        "iphone_recording": True,
+        "background_recording": True,
+        "diarized_transcription": True,
+        "opportunity_linking": True,
+        "voicepuck": "prototype_not_connected"
+    },
 }
 
 
@@ -1843,6 +2344,29 @@ def normalize_client_context(raw_context):
     if isinstance(utc_offset_minutes, (int, float)):
         context["utc_offset_minutes"] = int(utc_offset_minutes)
 
+    geo_session_id = raw_context.get("geo_session_id")
+    if isinstance(geo_session_id, str) and geo_session_id.strip():
+        context["geo_session_id"] = geo_session_id.strip()[:100]
+
+    raw_location = raw_context.get("location")
+    if isinstance(raw_location, dict):
+        try:
+            lat = float(raw_location.get("latitude"))
+            lon = float(raw_location.get("longitude"))
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                context["location"] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "accuracy_m": raw_location.get("accuracy_m"),
+                    "city": str(raw_location.get("city") or "")[:120] or None,
+                    "region": str(raw_location.get("region") or "")[:120] or None,
+                    "country": str(raw_location.get("country") or "")[:120] or None,
+                    "iso_country_code": str(raw_location.get("iso_country_code") or "")[:12] or None,
+                    "captured_at": str(raw_location.get("captured_at") or "")[:80] or None,
+                }
+        except Exception:
+            pass
+
     return context
 
 
@@ -1862,6 +2386,13 @@ def client_time_prompt(client_context):
         parts.append(
             "User UTC offset in minutes: "
             + str(client_context["utc_offset_minutes"])
+        )
+
+    if client_context.get("location"):
+        loc = client_context["location"]
+        parts.append(
+            "User device supplied a current foreground location: "
+            + (location_label(loc) or f"{loc.get('latitude')}, {loc.get('longitude')}")
         )
 
     return "\n".join(parts)
@@ -1909,6 +2440,7 @@ Use Luna low and answer directly.
 CRM_READ
 - Salesforce retrieval/filtering/counting/straightforward summarization.
 - Opportunities, accounts, customers, addresses, contacts, contact roles, Salesforce Events/meetings.
+- Nearby customer/account questions that depend on the user's current location.
 Use Luna low. needs_salesforce=true.
 
 CRM_ANALYSIS
@@ -1955,6 +2487,7 @@ Never pretend web research occurred.
 If current information is required, needs_web=true.
 If Salesforce data is required, needs_salesforce=true.
 If Salesforce changes are requested, needs_write=true.
+Nearby/"near me"/field-visit requests require Salesforce and the location-aware nearby tool.
 Every Salesforce write requires explicit confirmation.
 Do not unnecessarily escalate simple work.
 routing_note must be a short explanation, not chain-of-thought.
@@ -1967,6 +2500,7 @@ def route_or_answer(
     user_message,
     history=None,
     client_context=None,
+    location_context=None,
 ):
     history = history or []
     client_context = client_context or {}
@@ -2031,6 +2565,12 @@ Salesforce:
 - Resolve relative meeting dates/times from the supplied user device local time
   and timezone. Event date-times sent to tools must include an explicit offset.
 - Distinguish Salesforce facts from your interpretation.
+
+Location:
+- When the backend supplies a location context, use its effective CRM location for nearby workflows.
+- The backend, not the model, calculates geographic distance. Use find_nearby_accounts.
+- If location mode is demo, clearly label recommendations as using a demo-translated location.
+- Never pretend the user is physically located at the demo location.
 
 Web:
 - If this request was routed as needing web research, you MUST use web_search
@@ -2241,6 +2781,16 @@ def ui_block_from_tool_result(tool_name, result, call_id):
             "source_tool_call": call_id,
         }
 
+    if tool_name == "find_nearby_accounts":
+        return {
+            "type": "nearby_account_list",
+            "title": "Nearby customers",
+            "count": result.get("count", 0),
+            "items": result.get("nearby_accounts") or [],
+            "location_context": result.get("location_context"),
+            "source_tool_call": call_id,
+        }
+
     if tool_name == "search_events":
         return {
             "type": "event_list",
@@ -2288,6 +2838,17 @@ def build_conversation_text(display_text, ui_blocks, pending_actions):
                 )
             if rows:
                 parts.append("Structured opportunities shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "nearby_account_list":
+            rows = []
+            for index, item in enumerate(items[:10], start=1):
+                rows.append(
+                    f"{index}. Nearby Account: {(item.get('account') or {}).get('name')} | "
+                    f"Distance km: {item.get('distance_km')} | Open pipeline: {item.get('open_pipeline')} | "
+                    f"Top opportunity: {(item.get('top_opportunity') or {}).get('name')}"
+                )
+            if rows:
+                parts.append("Structured nearby Accounts shown on screen:\n" + "\n".join(rows))
 
         elif block_type == "event_list":
             rows = []
@@ -2357,6 +2918,7 @@ def execute_agent(
     claims,
     history=None,
     client_context=None,
+    location_context=None,
 ):
     history = history or []
     client_context = client_context or {}
@@ -2373,6 +2935,8 @@ def execute_agent(
                 + capability_prompt()
                 + "\n\n"
                 + client_time_prompt(client_context)
+                + "\n\n"
+                + location_prompt(location_context)
                 + "\n\nRoute selected: "
                 + decision.route
                 + "\nWeb required: "
@@ -2494,6 +3058,7 @@ def execute_agent(
                 "pending_actions": pending_actions,
                 "confirmation_required": bool(pending_actions),
                 "confirmation_token": confirmation_token,
+                "location_context": location_context,
             }
 
         for call in function_calls:
@@ -2520,6 +3085,7 @@ def execute_agent(
                         arguments,
                         sf,
                         salesforce_username,
+                        runtime_context={"location_context": location_context},
                     )
 
             if result.get("pending_action"):
@@ -2780,6 +3346,399 @@ def execute_confirmed_actions(claims, token_payload):
 
 
 # ============================================================
+# SESSIONS — AUDIO -> DIARIZATION -> MEETING INTELLIGENCE
+# ============================================================
+
+
+class SessionIntelligence(BaseModel):
+    title: str
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+    customer_needs: list[str] = Field(default_factory=list)
+    products_discussed: list[str] = Field(default_factory=list)
+    competitors: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    follow_ups: list[str] = Field(default_factory=list)
+    rep_commitments: list[str] = Field(default_factory=list)
+    customer_commitments: list[str] = Field(default_factory=list)
+    people_mentioned: list[str] = Field(default_factory=list)
+    linked_opportunity_id: Optional[str] = None
+    link_confidence: float = 0.0
+    link_reason: str = ""
+
+
+def open_opportunity_candidates(sf, salesforce_username):
+    result = tool_search_opportunities(
+        sf,
+        salesforce_username,
+        {
+            "name_contains": None,
+            "account_name_contains": None,
+            "status": "open",
+            "stage": None,
+            "min_amount": None,
+            "max_amount": None,
+            "close_date_from": None,
+            "close_date_to": None,
+            "account_city": None,
+            "account_state": None,
+            "account_country": None,
+            "include_contacts": True,
+            "limit": 100,
+        },
+    )
+    candidates = []
+    for opp in result.get("opportunities", []):
+        candidates.append({
+            "id": opp.get("id"),
+            "name": opp.get("name"),
+            "account": (opp.get("account") or {}).get("name"),
+            "stage": opp.get("stage"),
+            "amount": opp.get("amount"),
+            "close_date": opp.get("close_date"),
+            "next_step": opp.get("next_step"),
+            "description": opp.get("description"),
+            "contacts": [
+                {
+                    "name": (role.get("contact") or {}).get("name"),
+                    "title": (role.get("contact") or {}).get("title"),
+                    "role": role.get("role"),
+                }
+                for role in (opp.get("contacts") or [])[:8]
+            ],
+        })
+    return candidates
+
+
+def split_audio_if_needed(audio_path, processing_dir):
+    source = Path(audio_path)
+    if source.stat().st_size <= MAX_OPENAI_AUDIO_BYTES:
+        return [(source, 0.0)]
+
+    processing_dir = Path(processing_dir)
+    processing_dir.mkdir(parents=True, exist_ok=True)
+    pattern = processing_dir / "chunk_%03d.m4a"
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [
+        ffmpeg,
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:a:0",
+        "-c:a", "aac",
+        "-b:a", "48k",
+        "-ac", "1",
+        "-ar", "32000",
+        "-f", "segment",
+        "-segment_time", str(SESSION_CHUNK_SECONDS),
+        "-reset_timestamps", "1",
+        str(pattern),
+    ]
+    subprocess.run(command, check=True, timeout=20 * 60)
+    chunks = sorted(processing_dir.glob("chunk_*.m4a"))
+    if not chunks:
+        raise RuntimeError("Audio exceeded 25 MB and could not be split for transcription.")
+    for chunk in chunks:
+        if chunk.stat().st_size > MAX_OPENAI_AUDIO_BYTES:
+            raise RuntimeError("A generated transcription chunk still exceeds the OpenAI upload limit.")
+    return [(chunk, index * float(SESSION_CHUNK_SECONDS)) for index, chunk in enumerate(chunks)]
+
+
+def diarize_audio_files(audio_parts):
+    combined_segments = []
+    combined_text = []
+    duration = 0.0
+
+    for chunk_index, (path, offset) in enumerate(audio_parts):
+        with open(path, "rb") as audio_file:
+            audio_client = OpenAI(api_key=OPENAI_API_KEY, timeout=30 * 60)
+            transcript = audio_client.audio.transcriptions.create(
+                model="gpt-4o-transcribe-diarize",
+                file=audio_file,
+                response_format="diarized_json",
+                chunking_strategy="auto",
+            )
+        payload = transcript.model_dump() if hasattr(transcript, "model_dump") else dict(transcript)
+        chunk_text = str(payload.get("text") or "").strip()
+        if chunk_text:
+            combined_text.append(chunk_text)
+        for seg_index, segment in enumerate(payload.get("segments") or []):
+            segment = dict(segment)
+            raw_speaker = segment.get("speaker") or "Speaker"
+            speaker = raw_speaker if len(audio_parts) == 1 else f"Chunk {chunk_index + 1} · {raw_speaker}"
+            start = float(segment.get("start") or 0) + offset
+            end = float(segment.get("end") or 0) + offset
+            combined_segments.append({
+                "id": segment.get("id") or f"seg_{chunk_index}_{seg_index}",
+                "speaker": speaker,
+                "start": start,
+                "end": end,
+                "text": str(segment.get("text") or "").strip(),
+            })
+            duration = max(duration, end)
+
+    return {
+        "text": "\n".join(combined_text).strip(),
+        "segments": combined_segments,
+        "duration": duration,
+        "chunk_count": len(audio_parts),
+        "model": "gpt-4o-transcribe-diarize",
+    }
+
+
+def format_transcript_text(transcript_payload):
+    lines = []
+    for segment in transcript_payload.get("segments") or []:
+        start = int(float(segment.get("start") or 0))
+        minute, second = divmod(start, 60)
+        lines.append(f"[{minute:02d}:{second:02d}] {segment.get('speaker')}: {segment.get('text')}")
+    return "\n".join(lines)
+
+
+def analyze_session_transcript(transcript_payload, candidates):
+    segment_text = format_transcript_text(transcript_payload)
+    if len(segment_text) > 140000:
+        segment_text = segment_text[:140000]
+
+    candidate_payload = json.dumps(candidates, default=str)[:50000]
+    instructions = """
+You are CMD Sally's post-meeting intelligence engine.
+Analyze the speaker-labelled sales meeting transcript and compare it with the supplied
+LIVE Salesforce open-opportunity candidates.
+
+Rules:
+- Never invent a Salesforce opportunity. linked_opportunity_id must be null or exactly
+  one candidate id supplied below.
+- Link only when the transcript provides meaningful evidence of the same customer/deal.
+- A confidence >= 0.82 should mean a strong match suitable for automatic session linking.
+- Lower-confidence plausible matches may still be returned as suggestions.
+- Summaries must distinguish customer needs from seller commitments.
+- Keep follow-ups concrete and short.
+- Do not perform Salesforce writes. This step only links CMD Sally's Session metadata.
+"""
+    response = openai_client.responses.parse(
+        model="gpt-5.6-terra",
+        reasoning={"effort": "medium"},
+        store=False,
+        input=[
+            {"role": "developer", "content": instructions},
+            {
+                "role": "user",
+                "content": (
+                    "LIVE SALESFORCE OPEN OPPORTUNITIES:\n" + candidate_payload
+                    + "\n\nDIARIZED TRANSCRIPT:\n" + segment_text
+                ),
+            },
+        ],
+        text_format=SessionIntelligence,
+    )
+    parsed = response.output_parsed
+    if parsed is None:
+        raise RuntimeError("Meeting intelligence model returned no structured result.")
+    return parsed.model_dump()
+
+
+def process_session(session_id, owner_oid, salesforce_username):
+    try:
+        row = owner_session_row(session_id, owner_oid)
+        audio_path = row["audio_path"]
+        if not audio_path or not Path(audio_path).exists():
+            raise RuntimeError("Session audio file is missing.")
+
+        with session_db() as conn:
+            conn.execute(
+                "UPDATE sessions SET status=?, processing_error=NULL, updated_at=? WHERE session_id=?",
+                ("transcribing", utc_now_iso(), session_id),
+            )
+            conn.commit()
+
+        session_dir = Path(audio_path).parent
+        processing_dir = session_dir / "processing"
+        audio_parts = split_audio_if_needed(audio_path, processing_dir)
+        transcript_payload = diarize_audio_files(audio_parts)
+
+        transcript_json_path = session_dir / "transcript.json"
+        transcript_text_path = session_dir / "transcript.txt"
+        transcript_json_path.write_text(json.dumps(transcript_payload, indent=2), encoding="utf-8")
+        transcript_text_path.write_text(format_transcript_text(transcript_payload), encoding="utf-8")
+
+        with session_db() as conn:
+            conn.execute(
+                "UPDATE sessions SET status=?, transcript_json_path=?, transcript_text_path=?, updated_at=? WHERE session_id=?",
+                ("analyzing", str(transcript_json_path), str(transcript_text_path), utc_now_iso(), session_id),
+            )
+            conn.commit()
+
+        sf = get_salesforce_access_token(salesforce_username)
+        candidates = open_opportunity_candidates(sf, salesforce_username)
+        intelligence = analyze_session_transcript(transcript_payload, candidates)
+
+        candidate_by_id = {c["id"]: c for c in candidates if c.get("id")}
+        proposed_id = intelligence.get("linked_opportunity_id")
+        confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+        if proposed_id not in candidate_by_id:
+            proposed_id = None
+            confidence = 0.0
+
+        linked_id = proposed_id if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD else None
+        linked_name = candidate_by_id.get(linked_id, {}).get("name") if linked_id else None
+        suggested_id = proposed_id if proposed_id and not linked_id else None
+        suggested_name = candidate_by_id.get(suggested_id, {}).get("name") if suggested_id else None
+
+        summary_json_path = session_dir / "summary.json"
+        summary_json_path.write_text(json.dumps(intelligence, indent=2), encoding="utf-8")
+
+        with session_db() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status=?, title=?, summary_json_path=?, linked_opportunity_id=?, linked_opportunity_name=?,
+                    link_confidence=?, suggested_opportunity_id=?, suggested_opportunity_name=?, suggested_confidence=?,
+                    link_reason=?, processing_error=NULL, updated_at=?
+                WHERE session_id=?
+                """,
+                (
+                    "ready",
+                    (intelligence.get("title") or "Sales session")[:240],
+                    str(summary_json_path),
+                    linked_id,
+                    linked_name,
+                    confidence if linked_id else None,
+                    suggested_id,
+                    suggested_name,
+                    confidence if suggested_id else None,
+                    str(intelligence.get("link_reason") or "")[:2000],
+                    utc_now_iso(),
+                    session_id,
+                ),
+            )
+            conn.commit()
+
+    except Exception as exc:
+        try:
+            with session_db() as conn:
+                conn.execute(
+                    "UPDATE sessions SET status=?, processing_error=?, updated_at=? WHERE session_id=?",
+                    ("error", str(exc)[:4000], utc_now_iso(), session_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+
+SESSION_PROCESSING_IDS = set()
+SESSION_PROCESSING_LOCK = threading.Lock()
+
+
+def _session_processing_worker(session_id, owner_oid, salesforce_username):
+    try:
+        process_session(session_id, owner_oid, salesforce_username)
+    finally:
+        with SESSION_PROCESSING_LOCK:
+            SESSION_PROCESSING_IDS.discard(session_id)
+
+
+def launch_session_processing(session_id, owner_oid, salesforce_username):
+    with SESSION_PROCESSING_LOCK:
+        if session_id in SESSION_PROCESSING_IDS:
+            return False
+        SESSION_PROCESSING_IDS.add(session_id)
+
+    thread = threading.Thread(
+        target=_session_processing_worker,
+        args=(session_id, owner_oid, salesforce_username),
+        daemon=True,
+        name=f"session-{session_id}",
+    )
+    thread.start()
+    return True
+
+
+def insert_or_replace_uploaded_session(
+    session_id,
+    claims,
+    salesforce_username,
+    metadata,
+    audio_path,
+    audio_bytes,
+    actual_location,
+    effective_location,
+):
+    now = utc_now_iso()
+    voicepuck = metadata.get("voicepuck") or {
+        "assigned": False,
+        "connected": False,
+        "device_id": None,
+    }
+    with session_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                session_id, owner_oid, salesforce_username, title, status, source,
+                started_at, ended_at, duration_ms, audio_path, audio_bytes,
+                actual_location_json, effective_location_json, voicepuck_json,
+                processing_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                owner_oid=excluded.owner_oid,
+                salesforce_username=excluded.salesforce_username,
+                status=excluded.status,
+                source=excluded.source,
+                started_at=excluded.started_at,
+                ended_at=excluded.ended_at,
+                duration_ms=excluded.duration_ms,
+                audio_path=excluded.audio_path,
+                audio_bytes=excluded.audio_bytes,
+                actual_location_json=excluded.actual_location_json,
+                effective_location_json=excluded.effective_location_json,
+                voicepuck_json=excluded.voicepuck_json,
+                processing_error=NULL,
+                updated_at=excluded.updated_at
+            """,
+            (
+                session_id,
+                claims.get("oid"),
+                salesforce_username,
+                metadata.get("title") or "Processing session",
+                "uploaded",
+                metadata.get("source") or "iphone",
+                metadata.get("started_at"),
+                metadata.get("ended_at"),
+                int(metadata.get("duration_ms") or 0),
+                str(audio_path),
+                int(audio_bytes),
+                json.dumps(actual_location) if actual_location else None,
+                json.dumps(effective_location) if effective_location else None,
+                json.dumps(voicepuck),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def get_session_open_opportunity(sf, salesforce_username, opportunity_id):
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(opportunity_id)
+    soql = (
+        "SELECT Id, Name, StageName, Amount, CloseDate, Account.Name FROM Opportunity "
+        f"WHERE Id='{safe_id}' AND Owner.Username='{safe_username}' AND IsClosed=false LIMIT 1"
+    )
+    records = salesforce_query(sf["access_token"], sf["instance_url"], soql).get("records", [])
+    if not records:
+        raise ValueError("Open opportunity not found in the authenticated user's scope.")
+    row = records[0]
+    return {
+        "id": row.get("Id"),
+        "name": row.get("Name"),
+        "stage": row.get("StageName"),
+        "amount": row.get("Amount"),
+        "close_date": row.get("CloseDate"),
+        "account": (row.get("Account") or {}).get("Name"),
+    }
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 
@@ -2788,13 +3747,19 @@ def root():
     return jsonify({
         "service": "CMD Sally API",
         "status": "running",
-        "version": "cmd-sally-v2",
+        "version": "cmd-sally-v3",
     })
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "version": "cmd-sally-v3",
+        "session_storage_root": str(SESSION_STORAGE_ROOT),
+        "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
+        "demo_geo_enabled": DEMO_GEO_ENABLED,
+    })
 
 
 @app.get("/me")
@@ -2947,6 +3912,12 @@ def chat():
                 salesforce_username
             )
 
+        location_context = None
+        if sf is not None and client_context.get("location"):
+            location_context = resolve_location_context(
+                sf, salesforce_username, client_context, claims
+            )
+
         result = execute_agent(
             user_message,
             decision,
@@ -2955,6 +3926,7 @@ def chat():
             claims,
             history=history,
             client_context=client_context,
+            location_context=location_context,
         )
 
         response_body = {
@@ -2981,6 +3953,7 @@ def chat():
             "conversation_text": result["conversation_text"],
             "ui_blocks": result["ui_blocks"],
             "capabilities": CAPABILITY_MANIFEST,
+            "location_context": result.get("location_context"),
             "conversation_history_used": len(history),
         }
 
@@ -2996,6 +3969,193 @@ def chat():
             "error": "chat_failed",
             "details": str(e),
         }), 500
+
+
+@app.post("/location/resolve")
+@require_auth
+def resolve_device_location():
+    body = request.get_json(silent=True) or {}
+    client_context = normalize_client_context(body.get("client_context") or body)
+    if not client_context.get("location"):
+        return jsonify({"error": "location_required"}), 400
+
+    claims = request.user_claims
+    salesforce_username = claims.get("preferred_username")
+    if not salesforce_username:
+        return jsonify({"error": "preferred_username_missing"}), 400
+
+    try:
+        sf = get_salesforce_access_token(salesforce_username)
+        context = resolve_location_context(sf, salesforce_username, client_context, claims)
+        if context is None:
+            return jsonify({"error": "invalid_location"}), 400
+        return jsonify({"location_context": context})
+    except Exception as exc:
+        return jsonify({"error": "location_resolve_failed", "details": str(exc)}), 400
+
+
+@app.get("/sessions")
+@require_auth
+def list_sessions():
+    owner_oid = request.user_claims.get("oid")
+    with session_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sessions WHERE owner_oid=? ORDER BY created_at DESC LIMIT 100",
+            (owner_oid,),
+        ).fetchall()
+    return jsonify({
+        "sessions": [session_row_to_dict(row, include_summary=False) for row in rows],
+        "voicepuck": {"assigned": False, "connected": False, "device_id": None},
+        "storage_root": str(SESSION_STORAGE_ROOT),
+    })
+
+
+@app.post("/sessions/upload")
+@require_auth
+def upload_session():
+    claims = request.user_claims
+    owner_oid = claims.get("oid")
+    salesforce_username = claims.get("preferred_username")
+    if not owner_oid or not salesforce_username:
+        return jsonify({"error": "identity_missing"}), 400
+
+    audio = request.files.get("audio")
+    if audio is None:
+        return jsonify({"error": "audio_required"}), 400
+
+    try:
+        metadata = json.loads(request.form.get("metadata") or "{}")
+        session_id = safe_session_id(metadata.get("session_id") or request.form.get("session_id"))
+        user_dir = SESSION_AUDIO_ROOT / re.sub(r"[^A-Za-z0-9_-]", "_", owner_oid)
+        session_dir = user_dir / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = session_dir / "original.m4a"
+        audio.save(str(audio_path))
+        audio_bytes = audio_path.stat().st_size
+
+        raw_location = metadata.get("location") if isinstance(metadata.get("location"), dict) else None
+        client_context = {
+            "location": raw_location,
+            "geo_session_id": metadata.get("geo_session_id") or session_id,
+        } if raw_location else {}
+        location_context = None
+        if raw_location:
+            sf = get_salesforce_access_token(salesforce_username)
+            location_context = resolve_location_context(sf, salesforce_username, client_context, claims)
+
+        insert_or_replace_uploaded_session(
+            session_id,
+            claims,
+            salesforce_username,
+            metadata,
+            audio_path,
+            audio_bytes,
+            (location_context or {}).get("actual") if location_context else raw_location,
+            (location_context or {}).get("effective") if location_context else raw_location,
+        )
+        launch_session_processing(session_id, owner_oid, salesforce_username)
+        row = owner_session_row(session_id, owner_oid)
+        return jsonify({
+            "status": "uploaded",
+            "session": session_row_to_dict(row),
+            "location_context": location_context,
+        }), 202
+    except Exception as exc:
+        return jsonify({"error": "session_upload_failed", "details": str(exc)}), 400
+
+
+@app.get("/sessions/<session_id>")
+@require_auth
+def get_session(session_id):
+    try:
+        row = owner_session_row(session_id, request.user_claims.get("oid"))
+        return jsonify({"session": session_row_to_dict(row, include_summary=True)})
+    except Exception as exc:
+        return jsonify({"error": "session_not_found", "details": str(exc)}), 404
+
+
+@app.get("/sessions/<session_id>/transcript")
+@require_auth
+def get_session_transcript(session_id):
+    try:
+        row = owner_session_row(session_id, request.user_claims.get("oid"))
+        payload = read_json_file(row["transcript_json_path"], None)
+        if payload is None:
+            return jsonify({"error": "transcript_not_ready", "status": row["status"]}), 409
+        return jsonify({"session_id": session_id, **payload})
+    except Exception as exc:
+        return jsonify({"error": "transcript_failed", "details": str(exc)}), 404
+
+
+@app.get("/sessions/<session_id>/audio")
+@require_auth
+def get_session_audio(session_id):
+    try:
+        row = owner_session_row(session_id, request.user_claims.get("oid"))
+        path = row["audio_path"]
+        if not path or not Path(path).exists():
+            return jsonify({"error": "audio_not_found"}), 404
+        return send_file(path, mimetype="audio/mp4", conditional=True)
+    except Exception as exc:
+        return jsonify({"error": "audio_failed", "details": str(exc)}), 404
+
+
+@app.post("/sessions/<session_id>/retry")
+@require_auth
+def retry_session(session_id):
+    claims = request.user_claims
+    try:
+        row = owner_session_row(session_id, claims.get("oid"))
+        started = launch_session_processing(
+            session_id, claims.get("oid"), claims.get("preferred_username")
+        )
+        return jsonify({
+            "status": "processing_restarted" if started else "already_processing"
+        }), 202
+    except Exception as exc:
+        return jsonify({"error": "retry_failed", "details": str(exc)}), 400
+
+
+@app.get("/sessions/link-options")
+@require_auth
+def session_link_options():
+    claims = request.user_claims
+    try:
+        sf = get_salesforce_access_token(claims.get("preferred_username"))
+        candidates = open_opportunity_candidates(sf, claims.get("preferred_username"))
+        return jsonify({"opportunities": candidates})
+    except Exception as exc:
+        return jsonify({"error": "link_options_failed", "details": str(exc)}), 400
+
+
+@app.post("/sessions/<session_id>/link-opportunity")
+@require_auth
+def link_session_opportunity(session_id):
+    claims = request.user_claims
+    body = request.get_json(silent=True) or {}
+    opportunity_id = body.get("opportunity_id")
+    try:
+        owner_session_row(session_id, claims.get("oid"))
+        if opportunity_id:
+            sf = get_salesforce_access_token(claims.get("preferred_username"))
+            opp = get_session_open_opportunity(sf, claims.get("preferred_username"), opportunity_id)
+            linked_id, linked_name = opp["id"], opp["name"]
+        else:
+            linked_id, linked_name = None, None
+        with session_db() as conn:
+            conn.execute(
+                """
+                UPDATE sessions SET linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
+                    suggested_opportunity_id=NULL, suggested_opportunity_name=NULL, suggested_confidence=NULL,
+                    updated_at=? WHERE session_id=? AND owner_oid=?
+                """,
+                (linked_id, linked_name, 1.0 if linked_id else None, utc_now_iso(), session_id, claims.get("oid")),
+            )
+            conn.commit()
+        row = owner_session_row(session_id, claims.get("oid"))
+        return jsonify({"session": session_row_to_dict(row, include_summary=True)})
+    except Exception as exc:
+        return jsonify({"error": "link_failed", "details": str(exc)}), 400
 
 
 @app.post("/confirm")
