@@ -4,3 +4,4 @@ PyJWT[crypto]
 requests
 openai
 pydantic
+imageio-ffmpeg
