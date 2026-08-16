@@ -1,7 +1,8 @@
 import os
 import json
+import re
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import wraps
 from typing import Literal, Optional
 
@@ -185,6 +186,53 @@ def salesforce_update_opportunity(access_token, instance_url, opportunity_id, fi
     return True
 
 
+def salesforce_create_record(access_token, instance_url, object_name, fields):
+    response = requests.post(
+        f"{instance_url}/services/data/v{SF_API_VERSION}/sobjects/{object_name}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=fields,
+        timeout=30,
+    )
+
+    if response.status_code not in {200, 201}:
+        raise Exception(
+            f"Salesforce {object_name} create failed: "
+            f"{response.status_code} {response.text}"
+        )
+
+    data = response.json()
+    if not data.get("success") or not data.get("id"):
+        raise Exception(
+            f"Salesforce {object_name} create returned an unexpected response: {data}"
+        )
+
+    return data["id"]
+
+
+def salesforce_update_record(access_token, instance_url, object_name, record_id, fields):
+    response = requests.patch(
+        f"{instance_url}/services/data/v{SF_API_VERSION}"
+        f"/sobjects/{object_name}/{record_id}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=fields,
+        timeout=30,
+    )
+
+    if response.status_code != 204:
+        raise Exception(
+            f"Salesforce {object_name} update failed: "
+            f"{response.status_code} {response.text}"
+        )
+
+    return True
+
+
 # ============================================================
 # SAFE SOQL / VALUE HELPERS
 # ============================================================
@@ -221,6 +269,58 @@ def validate_iso_date(value):
     return str(value)
 
 
+def parse_iso_datetime(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("Date/time cannot be empty.")
+
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    parsed = datetime.fromisoformat(normalized)
+
+    if parsed.tzinfo is None:
+        raise ValueError(
+            "Date/time must include a timezone offset, for example "
+            "2026-08-18T14:00:00+05:30."
+        )
+
+    return parsed
+
+
+def normalize_salesforce_datetime(value):
+    parsed = parse_iso_datetime(value)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def salesforce_soql_datetime(value):
+    parsed = parse_iso_datetime(value)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def datetime_values_equivalent(a, b):
+    try:
+        return parse_iso_datetime(a).astimezone(timezone.utc) == parse_iso_datetime(b).astimezone(timezone.utc)
+    except Exception:
+        return False
+
+
+def salesforce_object_type_from_id(record_id):
+    if not record_id:
+        return None
+
+    prefix = str(record_id)[:3]
+    return {
+        "001": "Account",
+        "003": "Contact",
+        "006": "Opportunity",
+        "00Q": "Lead",
+        "00U": "Event",
+        "00T": "Task",
+    }.get(prefix, "Record")
+
+
 def clamp_limit(value, default=25, maximum=100):
     try:
         value = int(value)
@@ -236,6 +336,13 @@ def values_equivalent(a, b):
 
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return float(a) == float(b)
+
+    if isinstance(a, str) and isinstance(b, str):
+        if ("T" in a and (a.endswith("Z") or "+" in a[-6:] or a[-5:-4] == "-")) and (
+            "T" in b and (b.endswith("Z") or "+" in b[-6:] or b[-5:-4] == "-")
+        ):
+            if datetime_values_equivalent(a, b):
+                return True
 
     return str(a) == str(b)
 
@@ -687,6 +794,387 @@ def tool_search_accounts(sf, salesforce_username, args):
 
 
 # ============================================================
+# SALESFORCE EVENT HELPERS + READ TOOL
+# ============================================================
+
+def format_event(row):
+    if not row:
+        return None
+
+    who = row.get("Who") or {}
+    what = row.get("What") or {}
+    who_id = row.get("WhoId")
+    what_id = row.get("WhatId")
+
+    return {
+        "id": row.get("Id"),
+        "subject": row.get("Subject"),
+        "start_datetime": row.get("StartDateTime"),
+        "end_datetime": row.get("EndDateTime"),
+        "activity_date": row.get("ActivityDate"),
+        "is_all_day_event": row.get("IsAllDayEvent"),
+        "location": row.get("Location"),
+        "description": row.get("Description"),
+        "who": {
+            "id": who_id,
+            "name": who.get("Name"),
+            "type": salesforce_object_type_from_id(who_id),
+        } if who_id else None,
+        "what": {
+            "id": what_id,
+            "name": what.get("Name"),
+            "type": salesforce_object_type_from_id(what_id),
+        } if what_id else None,
+        "owner": {
+            "id": row.get("OwnerId"),
+            "name": (row.get("Owner") or {}).get("Name"),
+            "username": (row.get("Owner") or {}).get("Username"),
+        },
+    }
+
+
+def tool_search_events(sf, salesforce_username, args):
+    username = soql_escape(salesforce_username)
+    limit = clamp_limit(args.get("limit"), default=25)
+    related_name = (args.get("related_name_contains") or "").strip().lower()
+
+    # If we need to filter a polymorphic related-name in Python, fetch a slightly
+    # larger safe window and then trim back to the requested limit.
+    query_limit = min(100, max(limit, 75 if related_name else limit))
+
+    fields = [
+        "Id",
+        "Subject",
+        "StartDateTime",
+        "EndDateTime",
+        "ActivityDate",
+        "IsAllDayEvent",
+        "Location",
+        "Description",
+        "WhoId",
+        "WhatId",
+        "Who.Name",
+        "What.Name",
+        "OwnerId",
+        "Owner.Name",
+        "Owner.Username",
+    ]
+
+    where = [f"Owner.Username = '{username}'"]
+
+    if args.get("start_datetime_from"):
+        where.append(
+            "StartDateTime >= " + salesforce_soql_datetime(args["start_datetime_from"])
+        )
+
+    if args.get("start_datetime_to"):
+        where.append(
+            "StartDateTime <= " + salesforce_soql_datetime(args["start_datetime_to"])
+        )
+
+    if args.get("subject_contains"):
+        value = soql_like_escape(args["subject_contains"])
+        where.append(f"Subject LIKE '%{value}%'")
+
+    soql = (
+        "SELECT "
+        + ", ".join(fields)
+        + " FROM Event WHERE "
+        + " AND ".join(where)
+        + " ORDER BY StartDateTime ASC "
+        + f"LIMIT {query_limit}"
+    )
+
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+    events = [format_event(row) for row in data.get("records", [])]
+
+    if related_name:
+        events = [
+            event for event in events
+            if related_name in str((event.get("who") or {}).get("name") or "").lower()
+            or related_name in str((event.get("what") or {}).get("name") or "").lower()
+            or related_name in str(event.get("subject") or "").lower()
+        ]
+
+    events = events[:limit]
+
+    return {
+        "ok": True,
+        "count": len(events),
+        "events": events,
+    }
+
+
+def get_scoped_related_record(sf, salesforce_username, record_id, expected_role):
+    if not record_id:
+        return None
+
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(record_id)
+    object_type = salesforce_object_type_from_id(record_id)
+
+    if expected_role == "who":
+        if object_type != "Contact":
+            raise ValueError(
+                "For this pilot, Event WhoId may only reference a Salesforce Contact."
+            )
+
+        soql = (
+            "SELECT Id, Name, AccountId, Account.Name FROM Contact "
+            f"WHERE Id = '{safe_id}' AND AccountId IN ("
+            "SELECT AccountId FROM Opportunity "
+            f"WHERE Owner.Username = '{safe_username}'"
+            ") LIMIT 1"
+        )
+
+    elif expected_role == "what":
+        if object_type == "Opportunity":
+            soql = (
+                "SELECT Id, Name FROM Opportunity "
+                f"WHERE Id = '{safe_id}' "
+                f"AND Owner.Username = '{safe_username}' LIMIT 1"
+            )
+        elif object_type == "Account":
+            soql = (
+                "SELECT Id, Name FROM Account "
+                f"WHERE Id = '{safe_id}' AND Id IN ("
+                "SELECT AccountId FROM Opportunity "
+                f"WHERE Owner.Username = '{safe_username}'"
+                ") LIMIT 1"
+            )
+        else:
+            raise ValueError(
+                "For this pilot, Event WhatId may only reference an owned Opportunity "
+                "or an Account connected to the user's opportunities."
+            )
+    else:
+        raise ValueError("Unknown related-record role.")
+
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+    records = data.get("records", [])
+
+    if not records:
+        raise ValueError(
+            "The related Salesforce record was not found inside the authenticated user's CRM scope."
+        )
+
+    row = records[0]
+    return {
+        "id": row.get("Id"),
+        "name": row.get("Name"),
+        "type": object_type,
+    }
+
+
+def get_owned_event(sf, salesforce_username, event_id):
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(event_id)
+
+    soql = (
+        "SELECT Id, Subject, StartDateTime, EndDateTime, ActivityDate, "
+        "IsAllDayEvent, Location, Description, WhoId, WhatId, Who.Name, "
+        "What.Name, OwnerId, Owner.Name, Owner.Username "
+        "FROM Event "
+        f"WHERE Id = '{safe_id}' AND Owner.Username = '{safe_username}' LIMIT 1"
+    )
+
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+    records = data.get("records", [])
+
+    if not records:
+        raise ValueError(
+            "Event was not found in the authenticated user's owned Salesforce events."
+        )
+
+    return format_event(records[0])
+
+
+ALLOWED_EVENT_WRITE_FIELDS = {
+    "Subject",
+    "StartDateTime",
+    "EndDateTime",
+    "ActivityDate",
+    "IsAllDayEvent",
+    "Location",
+    "Description",
+    "WhoId",
+    "WhatId",
+}
+
+
+def normalize_event_write_value(field_name, new_value):
+    if field_name not in ALLOWED_EVENT_WRITE_FIELDS:
+        raise ValueError(f"Event field {field_name} is not allowed for AI updates.")
+
+    if field_name == "Subject":
+        if not isinstance(new_value, str) or not new_value.strip():
+            raise ValueError("Event Subject must be non-empty text.")
+        return new_value.strip()
+
+    if field_name in {"StartDateTime", "EndDateTime"}:
+        if new_value is None:
+            return None
+        return normalize_salesforce_datetime(new_value)
+
+    if field_name == "ActivityDate":
+        if new_value is None:
+            return None
+        return validate_iso_date(new_value)
+
+    if field_name == "IsAllDayEvent":
+        if not isinstance(new_value, bool):
+            raise ValueError("IsAllDayEvent must be true or false.")
+        return new_value
+
+    if field_name in {"Location", "Description"}:
+        if new_value is None:
+            return None
+        if not isinstance(new_value, str):
+            raise ValueError(f"{field_name} must be text or null.")
+        return new_value.strip() if field_name == "Location" else new_value
+
+    if field_name in {"WhoId", "WhatId"}:
+        if new_value is None:
+            return None
+        if not isinstance(new_value, str) or len(new_value.strip()) < 15:
+            raise ValueError(f"{field_name} must be a Salesforce record Id or null.")
+        return new_value.strip()
+
+    raise ValueError("Unsupported Event field.")
+
+
+def validate_event_temporal_fields(fields):
+    is_all_day = bool(fields.get("IsAllDayEvent"))
+
+    if is_all_day:
+        if not fields.get("ActivityDate"):
+            raise ValueError("All-day Events require ActivityDate.")
+        return
+
+    start = fields.get("StartDateTime")
+    end = fields.get("EndDateTime")
+
+    if not start or not end:
+        raise ValueError("Timed Events require both StartDateTime and EndDateTime.")
+
+    if parse_iso_datetime(end) <= parse_iso_datetime(start):
+        raise ValueError("Event EndDateTime must be after StartDateTime.")
+
+
+def tool_propose_create_event(sf, salesforce_username, args):
+    fields = {
+        "Subject": normalize_event_write_value("Subject", args.get("subject")),
+        "IsAllDayEvent": bool(args.get("is_all_day_event")),
+    }
+
+    optional_map = {
+        "start_datetime": "StartDateTime",
+        "end_datetime": "EndDateTime",
+        "activity_date": "ActivityDate",
+        "location": "Location",
+        "description": "Description",
+        "who_id": "WhoId",
+        "what_id": "WhatId",
+    }
+
+    for arg_name, field_name in optional_map.items():
+        value = args.get(arg_name)
+        if value is not None:
+            fields[field_name] = normalize_event_write_value(field_name, value)
+
+    validate_event_temporal_fields(fields)
+
+    who = get_scoped_related_record(
+        sf, salesforce_username, fields.get("WhoId"), "who"
+    ) if fields.get("WhoId") else None
+
+    what = get_scoped_related_record(
+        sf, salesforce_username, fields.get("WhatId"), "what"
+    ) if fields.get("WhatId") else None
+
+    action = {
+        "action": "create_event",
+        "event_subject": fields["Subject"],
+        "fields": fields,
+        "who": who,
+        "what": what,
+    }
+
+    return {
+        "ok": True,
+        "status": "pending_confirmation",
+        "message": (
+            "The Event has NOT been created in Salesforce. "
+            "It is queued for explicit user confirmation."
+        ),
+        "pending_action": action,
+    }
+
+
+def get_owned_event_field(sf, salesforce_username, event_id, field_name):
+    if field_name not in ALLOWED_EVENT_WRITE_FIELDS:
+        raise ValueError("Event field is not allowed.")
+
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(event_id)
+
+    soql = (
+        f"SELECT Id, Subject, {field_name} FROM Event "
+        f"WHERE Id = '{safe_id}' AND Owner.Username = '{safe_username}' LIMIT 1"
+    )
+
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+    records = data.get("records", [])
+
+    if not records:
+        raise ValueError(
+            "Event was not found in the authenticated user's owned Salesforce events."
+        )
+
+    row = records[0]
+    return {
+        "id": row.get("Id"),
+        "subject": row.get("Subject"),
+        "field_name": field_name,
+        "current_value": row.get(field_name),
+    }
+
+
+def tool_propose_update_event(sf, salesforce_username, args):
+    event_id = args["event_id"]
+    field_name = args["field_name"]
+    new_value = normalize_event_write_value(field_name, args.get("new_value"))
+
+    current = get_owned_event_field(
+        sf, salesforce_username, event_id, field_name
+    )
+
+    if field_name == "WhoId" and new_value:
+        get_scoped_related_record(sf, salesforce_username, new_value, "who")
+    elif field_name == "WhatId" and new_value:
+        get_scoped_related_record(sf, salesforce_username, new_value, "what")
+
+    action = {
+        "action": "update_event",
+        "event_id": current["id"],
+        "event_subject": current["subject"],
+        "field_name": field_name,
+        "old_value": current["current_value"],
+        "new_value": new_value,
+    }
+
+    return {
+        "ok": True,
+        "status": "pending_confirmation",
+        "message": (
+            "The Event update has NOT been written to Salesforce. "
+            "It is queued for explicit user confirmation."
+        ),
+        "pending_action": action,
+    }
+
+
+# ============================================================
 # SALESFORCE WRITE PROPOSAL TOOL
 # ============================================================
 
@@ -968,6 +1456,48 @@ CRM_READ_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "search_events",
+        "description": (
+            "Search Salesforce Events owned by the authenticated user. Use this "
+            "for meetings, appointments, scheduled customer visits, and calendar "
+            "questions. Resolve relative dates using the supplied user device time."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_datetime_from": {
+                    "type": ["string", "null"],
+                    "description": "ISO 8601 date-time with explicit timezone offset.",
+                },
+                "start_datetime_to": {
+                    "type": ["string", "null"],
+                    "description": "ISO 8601 date-time with explicit timezone offset.",
+                },
+                "subject_contains": {"type": ["string", "null"]},
+                "related_name_contains": {
+                    "type": ["string", "null"],
+                    "description": "Contact, Account, Opportunity, or subject name fragment.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+            },
+            "required": [
+                "start_datetime_from",
+                "start_datetime_to",
+                "subject_contains",
+                "related_name_contains",
+                "limit",
+            ],
+            "additionalProperties": False,
+        },
+    },
+
 ]
 
 
@@ -1007,14 +1537,85 @@ CRM_WRITE_TOOLS = [
                     ),
                 },
             },
+            "required": ["opportunity_id", "field_name", "new_value"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_create_event",
+        "description": (
+            "Propose creating a Salesforce Event owned by the authenticated user. "
+            "This NEVER creates the Event immediately. Timed events require start "
+            "and end date-times with explicit timezone offsets. If the user gives a "
+            "start time but no duration, use a 60-minute default unless context makes "
+            "another duration clearly appropriate. WhoId is a Contact; WhatId may be "
+            "an Account or Opportunity in the user's CRM scope."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "start_datetime": {"type": ["string", "null"]},
+                "end_datetime": {"type": ["string", "null"]},
+                "activity_date": {"type": ["string", "null"]},
+                "is_all_day_event": {"type": "boolean"},
+                "location": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "who_id": {"type": ["string", "null"]},
+                "what_id": {"type": ["string", "null"]},
+            },
             "required": [
-                "opportunity_id",
-                "field_name",
-                "new_value",
+                "subject",
+                "start_datetime",
+                "end_datetime",
+                "activity_date",
+                "is_all_day_event",
+                "location",
+                "description",
+                "who_id",
+                "what_id",
             ],
             "additionalProperties": False,
         },
-    }
+    },
+    {
+        "type": "function",
+        "name": "propose_update_event",
+        "description": (
+            "Propose changing ONE allowed field on a Salesforce Event owned by the "
+            "authenticated user. This NEVER writes immediately. For moving a timed "
+            "meeting while preserving duration, normally propose both StartDateTime "
+            "and EndDateTime as separate pending actions."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string"},
+                "field_name": {
+                    "type": "string",
+                    "enum": [
+                        "Subject",
+                        "StartDateTime",
+                        "EndDateTime",
+                        "ActivityDate",
+                        "IsAllDayEvent",
+                        "Location",
+                        "Description",
+                        "WhoId",
+                        "WhatId",
+                    ],
+                },
+                "new_value": {
+                    "type": ["string", "boolean", "null"],
+                },
+            },
+            "required": ["event_id", "field_name", "new_value"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -1050,8 +1651,29 @@ def run_function_tool(
                 arguments,
             )
 
+        if tool_name == "search_events":
+            return tool_search_events(
+                sf,
+                salesforce_username,
+                arguments,
+            )
+
         if tool_name == "propose_update_opportunity":
             return tool_propose_update_opportunity(
+                sf,
+                salesforce_username,
+                arguments,
+            )
+
+        if tool_name == "propose_create_event":
+            return tool_propose_create_event(
+                sf,
+                salesforce_username,
+                arguments,
+            )
+
+        if tool_name == "propose_update_event":
+            return tool_propose_update_event(
                 sf,
                 salesforce_username,
                 arguments,
@@ -1067,6 +1689,34 @@ def run_function_tool(
             "ok": False,
             "error": str(e),
         }
+
+
+# ============================================================
+# CAPABILITY MANIFEST
+# ============================================================
+
+CAPABILITY_MANIFEST = {
+    "salesforce": {
+        "search_opportunities": True,
+        "search_accounts": True,
+        "search_contacts": True,
+        "update_opportunities": True,
+        "search_events": True,
+        "create_events": True,
+        "update_events": True,
+        "create_tasks": False,
+        "send_email": False,
+    },
+    "web_research": True,
+}
+
+
+def capability_prompt():
+    return (
+        "Available CMD Sally capabilities (authoritative):\n"
+        + json.dumps(CAPABILITY_MANIFEST, indent=2)
+        + "\nNever claim an unavailable capability exists."
+    )
 
 
 # ============================================================
@@ -1258,7 +1908,7 @@ Use Luna low and answer directly.
 
 CRM_READ
 - Salesforce retrieval/filtering/counting/straightforward summarization.
-- Opportunities, accounts, customers, addresses, contacts, contact roles.
+- Opportunities, accounts, customers, addresses, contacts, contact roles, Salesforce Events/meetings.
 Use Luna low. needs_salesforce=true.
 
 CRM_ANALYSIS
@@ -1298,7 +1948,7 @@ RULES
 Never fabricate Salesforce data.
 Never answer Salesforce-specific questions without Salesforce data.
 If the latest message refers to a Salesforce account, opportunity, contact,
-customer, deal, or prior CRM result from the conversation, normally route with
+customer, deal, Event/meeting, or prior CRM result from the conversation, normally route with
 needs_salesforce=true so the current CRM state can be verified.
 Conversation history is context, not proof that a CRM fact is still current.
 Never pretend web research occurred.
@@ -1359,13 +2009,14 @@ You are CMD Sally, an enterprise sales CRM and research assistant.
 Conversation:
 - Treat the latest user message as a continuation of the recent conversation.
 - Resolve pronouns and references from history when the referent is clear.
-- Do not make the user repeat a customer, opportunity, contact, date, or choice
-  that is already clear from the conversation.
+- Do not make the user repeat a customer, opportunity, contact, Event, date, or
+  choice that is already clear from the conversation.
 - If a follow-up depends on CRM state, re-query Salesforce as needed rather than
   assuming an old value is still current.
 - If more than one plausible referent remains, ask one concise clarification.
-- Do not claim a tool/action exists merely because an earlier assistant message
-  claimed it. The actual tools supplied to this request are authoritative.
+- The capability manifest and actual tools supplied to this request are
+  authoritative. Never claim a capability exists merely because an earlier
+  assistant message claimed it.
 
 Salesforce:
 - The user is authenticated through Microsoft Entra.
@@ -1375,6 +2026,10 @@ Salesforce:
 - Account billing/shipping addresses are customer/site address information.
 - Contact mailing addresses are contact-level addresses.
 - Opportunity contacts are represented by Opportunity Contact Roles.
+- Salesforce Events represent meetings/appointments. WhoId is the person side
+  (Contact in this pilot); WhatId is the related Account or Opportunity.
+- Resolve relative meeting dates/times from the supplied user device local time
+  and timezone. Event date-times sent to tools must include an explicit offset.
 - Distinguish Salesforce facts from your interpretation.
 
 Web:
@@ -1385,13 +2040,25 @@ Web:
 - Keep source attribution clear.
 
 Writes:
-- The only write-capable tool is propose_update_opportunity.
-- It DOES NOT execute a write.
-- It only creates a pending action.
-- Never say Salesforce was updated until the backend confirmation endpoint
+- Write-capable tools only PROPOSE changes; they never write immediately.
+- Supported write proposals are Opportunity updates, Event creation, and Event updates.
+- Never say Salesforce was updated/created until the backend confirmation endpoint
   reports success.
-- If changes are pending, summarize exactly what would change and tell the
-  user explicit confirmation is required.
+- If changes are pending, summarize exactly what would change and tell the user
+  explicit confirmation is required.
+
+Presentation:
+- The mobile UI renders structured CRM results separately from your prose.
+- Do NOT dump Salesforce rows into a long prose list or Markdown table.
+- display_text should explain the result, highlight conclusions, and stay concise.
+- speech_text is private text for device TTS and is NOT displayed. It must sound
+  natural when spoken. Do not read tables, URLs, Salesforce IDs, citations, or
+  long lists unless the user explicitly asked you to read them. Prefer totals,
+  priorities, and the most important 1-3 items, then say that details are on screen.
+- When the user explicitly asks to hear/read the detailed list, speech_text may
+  contain more detail.
+- Your FINAL response must be ONLY a valid JSON object, with no Markdown fences:
+  {"display_text":"...","speech_text":"..."}
 
 You may call multiple tools and combine Salesforce data with web research.
 """
@@ -1492,17 +2159,172 @@ def dedupe_pending_actions(actions):
     seen = set()
 
     for action in actions:
-        key = (
-            action.get("opportunity_id"),
-            action.get("field_name"),
-            json.dumps(action.get("new_value"), sort_keys=True),
-        )
+        action_type = action.get("action")
+
+        if action_type == "update_opportunity":
+            key = (
+                action_type,
+                action.get("opportunity_id"),
+                action.get("field_name"),
+                json.dumps(action.get("new_value"), sort_keys=True),
+            )
+        elif action_type == "update_event":
+            key = (
+                action_type,
+                action.get("event_id"),
+                action.get("field_name"),
+                json.dumps(action.get("new_value"), sort_keys=True),
+            )
+        elif action_type == "create_event":
+            key = (
+                action_type,
+                json.dumps(action.get("fields") or {}, sort_keys=True),
+            )
+        else:
+            key = (action_type, json.dumps(action, sort_keys=True, default=str))
 
         if key not in seen:
             seen.add(key)
             unique.append(action)
 
     return unique
+
+
+def parse_agent_presentation(raw_text):
+    raw = (raw_text or "").strip()
+    if not raw:
+        raise ValueError("Agent returned an empty final response.")
+
+    candidate = raw
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\\s*", "", candidate, flags=re.I)
+        candidate = re.sub(r"\\s*```$", "", candidate)
+
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        # Backward-compatible safety fallback: show the text and speak a shortened
+        # version. This prevents a malformed presentation wrapper from breaking chat.
+        clean = raw[:6000]
+        speech = clean
+        if len(speech) > 650:
+            speech = speech[:600].rsplit(" ", 1)[0] + ". I've put the details on screen."
+        return {
+            "display_text": clean,
+            "speech_text": speech,
+        }
+
+    display_text = str(data.get("display_text") or "").strip()
+    speech_text = str(data.get("speech_text") or "").strip()
+
+    if not display_text:
+        display_text = "I've put the result on screen."
+    if not speech_text:
+        speech_text = display_text
+
+    return {
+        "display_text": display_text[:8000],
+        "speech_text": speech_text[:2400],
+    }
+
+
+def ui_block_from_tool_result(tool_name, result, call_id):
+    if not result or not result.get("ok"):
+        return None
+
+    if tool_name == "search_opportunities":
+        return {
+            "type": "opportunity_list",
+            "title": "Opportunities",
+            "count": result.get("count", 0),
+            "items": result.get("opportunities") or [],
+            "source_tool_call": call_id,
+        }
+
+    if tool_name == "search_events":
+        return {
+            "type": "event_list",
+            "title": "Salesforce Events",
+            "count": result.get("count", 0),
+            "items": result.get("events") or [],
+            "source_tool_call": call_id,
+        }
+
+    if tool_name == "search_accounts":
+        return {
+            "type": "account_list",
+            "title": "Accounts",
+            "count": result.get("count", 0),
+            "items": result.get("accounts") or [],
+            "source_tool_call": call_id,
+        }
+
+    if tool_name == "search_contacts":
+        return {
+            "type": "contact_list",
+            "title": "Contacts",
+            "count": result.get("count", 0),
+            "items": result.get("contacts") or [],
+            "source_tool_call": call_id,
+        }
+
+    return None
+
+
+def build_conversation_text(display_text, ui_blocks, pending_actions):
+    parts = [display_text]
+
+    for block in ui_blocks or []:
+        block_type = block.get("type")
+        items = block.get("items") or []
+
+        if block_type == "opportunity_list":
+            rows = []
+            for index, item in enumerate(items[:15], start=1):
+                rows.append(
+                    f"{index}. Opportunity: {item.get('name')} | Account: "
+                    f"{(item.get('account') or {}).get('name')} | Stage: {item.get('stage')} | "
+                    f"Amount: {item.get('amount')} | Close: {item.get('close_date')}"
+                )
+            if rows:
+                parts.append("Structured opportunities shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "event_list":
+            rows = []
+            for index, item in enumerate(items[:15], start=1):
+                rows.append(
+                    f"{index}. Event: {item.get('subject')} | Start: {item.get('start_datetime')} | "
+                    f"End: {item.get('end_datetime')} | Who: {(item.get('who') or {}).get('name')} | "
+                    f"What: {(item.get('what') or {}).get('name')}"
+                )
+            if rows:
+                parts.append("Structured Events shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "account_list":
+            rows = [
+                f"{i}. Account: {item.get('name')} | Industry: {item.get('industry')}"
+                for i, item in enumerate(items[:15], start=1)
+            ]
+            if rows:
+                parts.append("Structured Accounts shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "contact_list":
+            rows = [
+                f"{i}. Contact: {item.get('name')} | Title: {item.get('title')} | "
+                f"Account: {(item.get('account') or {}).get('name')}"
+                for i, item in enumerate(items[:15], start=1)
+            ]
+            if rows:
+                parts.append("Structured Contacts shown on screen:\n" + "\n".join(rows))
+
+    if pending_actions:
+        parts.append(
+            "Pending Salesforce actions shown for confirmation: "
+            + json.dumps(pending_actions, default=str)[:5000]
+        )
+
+    return "\n\n".join(parts)[:12000]
+
 
 
 def create_confirmation_token(claims, salesforce_username, actions):
@@ -1548,6 +2370,8 @@ def execute_agent(
             "content": (
                 AGENT_INSTRUCTIONS
                 + "\n\n"
+                + capability_prompt()
+                + "\n\n"
                 + client_time_prompt(client_context)
                 + "\n\nRoute selected: "
                 + decision.route
@@ -1564,6 +2388,7 @@ def execute_agent(
 
     tool_trace = []
     pending_actions = []
+    ui_blocks = []
     all_web_sources = {}
     web_search_trace = []
     web_used = False
@@ -1628,13 +2453,14 @@ def execute_agent(
                 force_web_next_round = True
                 continue
 
-            answer = (response.output_text or "").strip()
+            raw_answer = (response.output_text or "").strip()
 
-            if not answer:
+            if not raw_answer:
                 raise Exception(
                     "Agent completed without a final text answer."
                 )
 
+            presentation = parse_agent_presentation(raw_answer)
             pending_actions = dedupe_pending_actions(pending_actions)
 
             confirmation_token = None
@@ -1646,8 +2472,18 @@ def execute_agent(
                     pending_actions,
                 )
 
+            conversation_text = build_conversation_text(
+                presentation["display_text"],
+                ui_blocks,
+                pending_actions,
+            )
+
             return {
-                "answer": answer,
+                "answer": presentation["display_text"],
+                "display_text": presentation["display_text"],
+                "speech_text": presentation["speech_text"],
+                "conversation_text": conversation_text,
+                "ui_blocks": ui_blocks,
                 "execution_model": model,
                 "reasoning_effort": effort,
                 "tool_rounds": round_number - 1,
@@ -1689,6 +2525,10 @@ def execute_agent(
             if result.get("pending_action"):
                 pending_actions.append(result["pending_action"])
 
+            ui_block = ui_block_from_tool_result(call.name, result, call.call_id)
+            if ui_block:
+                ui_blocks.append(ui_block)
+
             tool_trace.append({
                 "round": round_number,
                 "tool": call.name,
@@ -1728,14 +2568,10 @@ def execute_confirmed_actions(claims, token_payload):
         raise ValueError("Invalid confirmation token type.")
 
     if token_payload.get("oid") != claims.get("oid"):
-        raise ValueError(
-            "Confirmation token belongs to a different Entra user."
-        )
+        raise ValueError("Confirmation token belongs to a different Entra user.")
 
     if token_payload.get("tid") != claims.get("tid"):
-        raise ValueError(
-            "Confirmation token belongs to a different Entra tenant."
-        )
+        raise ValueError("Confirmation token belongs to a different Entra tenant.")
 
     salesforce_username = claims.get("preferred_username")
 
@@ -1743,79 +2579,204 @@ def execute_confirmed_actions(claims, token_payload):
         not salesforce_username
         or token_payload.get("salesforce_username") != salesforce_username
     ):
-        raise ValueError(
-            "Confirmation token Salesforce identity does not match."
-        )
+        raise ValueError("Confirmation token Salesforce identity does not match.")
 
     actions = token_payload.get("actions") or []
-
     if not actions:
         raise ValueError("No actions were found in the confirmation token.")
 
     sf = get_salesforce_access_token(salesforce_username)
-
-    # First validate every action and check for stale data.
     validated = []
 
+    # Prevalidate every action before executing anything.
     for action in actions:
-        if action.get("action") != "update_opportunity":
-            raise ValueError("Unsupported confirmed action.")
+        action_type = action.get("action")
 
-        field_name = action.get("field_name")
-        opportunity_id = action.get("opportunity_id")
-
-        new_value = normalize_opportunity_write_value(
-            field_name,
-            action.get("new_value"),
-        )
-
-        current = get_owned_opportunity_field(
-            sf,
-            salesforce_username,
-            opportunity_id,
-            field_name,
-        )
-
-        if not values_equivalent(
-            current["current_value"],
-            action.get("old_value"),
-        ):
-            raise ValueError(
-                f"Conflict: {current['name']} → {field_name} changed "
-                "after the proposal was created. No writes were executed."
+        if action_type == "update_opportunity":
+            field_name = action.get("field_name")
+            opportunity_id = action.get("opportunity_id")
+            new_value = normalize_opportunity_write_value(
+                field_name, action.get("new_value")
+            )
+            current = get_owned_opportunity_field(
+                sf, salesforce_username, opportunity_id, field_name
             )
 
-        validated.append({
-            "opportunity_id": current["id"],
-            "opportunity_name": current["name"],
-            "field_name": field_name,
-            "old_value": current["current_value"],
-            "new_value": new_value,
-        })
+            if not values_equivalent(current["current_value"], action.get("old_value")):
+                raise ValueError(
+                    f"Conflict: {current['name']} → {field_name} changed after the "
+                    "proposal was created. No writes were executed."
+                )
 
-    # PoC behavior: execute sequentially after all pre-checks pass.
+            validated.append({
+                "action": action_type,
+                "opportunity_id": current["id"],
+                "opportunity_name": current["name"],
+                "field_name": field_name,
+                "old_value": current["current_value"],
+                "new_value": new_value,
+            })
+            continue
+
+        if action_type == "create_event":
+            raw_fields = action.get("fields") or {}
+            fields = {}
+            for field_name, value in raw_fields.items():
+                fields[field_name] = normalize_event_write_value(field_name, value)
+
+            validate_event_temporal_fields(fields)
+
+            if fields.get("WhoId"):
+                get_scoped_related_record(
+                    sf, salesforce_username, fields["WhoId"], "who"
+                )
+            if fields.get("WhatId"):
+                get_scoped_related_record(
+                    sf, salesforce_username, fields["WhatId"], "what"
+                )
+
+            validated.append({
+                "action": action_type,
+                "fields": fields,
+                "event_subject": fields.get("Subject"),
+            })
+            continue
+
+        if action_type == "update_event":
+            event_id = action.get("event_id")
+            field_name = action.get("field_name")
+            new_value = normalize_event_write_value(
+                field_name, action.get("new_value")
+            )
+            current = get_owned_event_field(
+                sf, salesforce_username, event_id, field_name
+            )
+
+            if not values_equivalent(current["current_value"], action.get("old_value")):
+                raise ValueError(
+                    f"Conflict: Event '{current['subject']}' → {field_name} changed "
+                    "after the proposal was created. No writes were executed."
+                )
+
+            if field_name == "WhoId" and new_value:
+                get_scoped_related_record(sf, salesforce_username, new_value, "who")
+            elif field_name == "WhatId" and new_value:
+                get_scoped_related_record(sf, salesforce_username, new_value, "what")
+
+            validated.append({
+                "action": action_type,
+                "event_id": current["id"],
+                "event_subject": current["subject"],
+                "field_name": field_name,
+                "old_value": current["current_value"],
+                "new_value": new_value,
+            })
+            continue
+
+        raise ValueError(f"Unsupported confirmed action: {action_type}")
+
     results = []
 
     for action in validated:
-        salesforce_update_opportunity(
-            sf["access_token"],
-            sf["instance_url"],
-            action["opportunity_id"],
-            {
-                action["field_name"]: action["new_value"]
-            },
-        )
+        action_type = action["action"]
 
-        results.append({
-            "opportunity_id": action["opportunity_id"],
-            "opportunity_name": action["opportunity_name"],
-            "field_name": action["field_name"],
-            "old_value": action["old_value"],
-            "new_value": action["new_value"],
-            "status": "updated",
-        })
+        if action_type == "update_opportunity":
+            salesforce_update_opportunity(
+                sf["access_token"],
+                sf["instance_url"],
+                action["opportunity_id"],
+                {action["field_name"]: action["new_value"]},
+            )
+
+            verified = get_owned_opportunity_field(
+                sf,
+                salesforce_username,
+                action["opportunity_id"],
+                action["field_name"],
+            )
+
+            if not values_equivalent(verified["current_value"], action["new_value"]):
+                raise ValueError("Salesforce Opportunity write could not be verified.")
+
+            results.append({
+                **action,
+                "status": "updated_and_verified",
+                "verified_value": verified["current_value"],
+            })
+            continue
+
+        if action_type == "create_event":
+            event_id = salesforce_create_record(
+                sf["access_token"],
+                sf["instance_url"],
+                "Event",
+                action["fields"],
+            )
+
+            event = get_owned_event(sf, salesforce_username, event_id)
+
+            for field_name, expected in action["fields"].items():
+                actual_key = {
+                    "Subject": "subject",
+                    "StartDateTime": "start_datetime",
+                    "EndDateTime": "end_datetime",
+                    "ActivityDate": "activity_date",
+                    "IsAllDayEvent": "is_all_day_event",
+                    "Location": "location",
+                    "Description": "description",
+                    "WhoId": None,
+                    "WhatId": None,
+                }.get(field_name)
+
+                if field_name == "WhoId":
+                    actual = (event.get("who") or {}).get("id")
+                elif field_name == "WhatId":
+                    actual = (event.get("what") or {}).get("id")
+                else:
+                    actual = event.get(actual_key)
+
+                if not values_equivalent(actual, expected):
+                    raise ValueError(
+                        f"Salesforce Event creation could not be verified for {field_name}."
+                    )
+
+            results.append({
+                "action": action_type,
+                "event_id": event_id,
+                "event_subject": event.get("subject"),
+                "status": "created_and_verified",
+                "event": event,
+            })
+            continue
+
+        if action_type == "update_event":
+            salesforce_update_record(
+                sf["access_token"],
+                sf["instance_url"],
+                "Event",
+                action["event_id"],
+                {action["field_name"]: action["new_value"]},
+            )
+
+            verified = get_owned_event_field(
+                sf,
+                salesforce_username,
+                action["event_id"],
+                action["field_name"],
+            )
+
+            if not values_equivalent(verified["current_value"], action["new_value"]):
+                raise ValueError("Salesforce Event update could not be verified.")
+
+            results.append({
+                **action,
+                "status": "updated_and_verified",
+                "verified_value": verified["current_value"],
+            })
+            continue
 
     return results
+
 
 
 # ============================================================
@@ -1827,7 +2788,7 @@ def root():
     return jsonify({
         "service": "CMD Sally API",
         "status": "running",
-        "version": "conversational-v1",
+        "version": "cmd-sally-v2",
     })
 
 
@@ -1966,6 +2927,11 @@ def chat():
                 "route": route_data,
                 "execution_model": "gpt-5.6-luna",
                 "answer": decision.answer,
+                "display_text": decision.answer,
+                "speech_text": decision.answer,
+                "conversation_text": decision.answer,
+                "ui_blocks": [],
+                "capabilities": CAPABILITY_MANIFEST,
                 "tool_trace": [],
                 "web_used": False,
                 "web_sources": [],
@@ -2010,6 +2976,11 @@ def chat():
             "pending_actions": result["pending_actions"],
             "confirmation_required": result["confirmation_required"],
             "answer": result["answer"],
+            "display_text": result["display_text"],
+            "speech_text": result["speech_text"],
+            "conversation_text": result["conversation_text"],
+            "ui_blocks": result["ui_blocks"],
+            "capabilities": CAPABILITY_MANIFEST,
             "conversation_history_used": len(history),
         }
 
@@ -2050,6 +3021,7 @@ def confirm():
 
         return jsonify({
             "status": "confirmed",
+            "affected_count": len(results),
             "updated_count": len(results),
             "results": results,
         })
