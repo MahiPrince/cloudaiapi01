@@ -8,6 +8,9 @@ import sqlite3
 import threading
 import uuid
 import subprocess
+import shutil
+import hmac
+import secrets
 from pathlib import Path
 from datetime import date, datetime, timezone
 from functools import wraps
@@ -15,10 +18,14 @@ from typing import Literal, Optional
 
 import jwt
 import requests
-from flask import Flask, jsonify, request, send_file
+from flask import (
+    Flask, jsonify, request, send_file, session, redirect, url_for,
+    render_template, abort,
+)
 from jwt import PyJWKClient
 from openai import OpenAI
 from pydantic import BaseModel, Field
+from werkzeug.exceptions import HTTPException
 import imageio_ffmpeg
 
 
@@ -60,6 +67,22 @@ SESSION_AUTO_LINK_THRESHOLD = float(os.environ.get("SESSION_AUTO_LINK_THRESHOLD"
 MAX_OPENAI_AUDIO_BYTES = 24_000_000  # leave headroom below the 25 MB API ceiling
 SESSION_CHUNK_SECONDS = int(os.environ.get("SESSION_CHUNK_SECONDS", "1200"))
 
+# Demo admin console. No default password is provided: /admin remains unavailable
+# until these values are configured in Render.
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_SESSION_SECRET = os.environ.get("ADMIN_SESSION_SECRET", "").strip()
+ADMIN_COOKIE_SECURE = os.environ.get("ADMIN_COOKIE_SECURE", "true").strip().lower() not in {"0", "false", "no"}
+CHAT_JOB_MAX_CONCURRENT = max(1, int(os.environ.get("CHAT_JOB_MAX_CONCURRENT", "2")))
+CHAT_JOB_TTL_SECONDS = max(300, int(os.environ.get("CHAT_JOB_TTL_SECONDS", "3600")))
+
+app.secret_key = ADMIN_SESSION_SECRET or APP_SIGNING_SECRET
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=ADMIN_COOKIE_SECURE,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -85,13 +108,21 @@ def _ensure_session_storage():
 _ensure_session_storage()
 SESSION_DB_PATH = SESSION_STORAGE_ROOT / "sessions.db"
 SESSION_AUDIO_ROOT = SESSION_STORAGE_ROOT / "sessions"
+SESSION_DELETED_ROOT = SESSION_STORAGE_ROOT / "deleted_sessions"
 SESSION_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
+SESSION_DELETED_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def session_db():
     conn = sqlite3.connect(str(SESSION_DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_column(conn, table_name, column_name, ddl):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
 
 def init_session_db():
@@ -129,14 +160,288 @@ def init_session_db():
             )
             """
         )
+        _ensure_column(conn, "sessions", "deleted_at", "TEXT")
+        _ensure_column(conn, "sessions", "deleted_by", "TEXT")
+        _ensure_column(conn, "sessions", "deleted_archive_path", "TEXT")
+
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                owner_oid TEXT,
+                salesforce_username TEXT,
+                request_id TEXT,
+                summary TEXT,
+                details_json TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS config_feature_flags (
+                key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS config_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS config_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                triggers_json TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                tools_json TEXT NOT NULL,
+                confirmation_required INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS config_jargon (
+                id TEXT PRIMARY KEY,
+                term TEXT NOT NULL,
+                aliases_json TEXT NOT NULL,
+                pronunciation TEXT,
+                category TEXT,
+                definition TEXT NOT NULL,
+                examples TEXT,
+                stt_priority TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS config_knowledge (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                category TEXT,
+                content TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.commit()
+
+
+def seed_demo_admin_config():
+    now = datetime.now(timezone.utc).isoformat()
+    default_flags = {
+        "salesforce_reads": True,
+        "salesforce_writes": True,
+        "web_research": True,
+        "session_recording": True,
+        "session_soft_delete": True,
+        "location": True,
+        "demo_geography": DEMO_GEO_ENABLED,
+        "long_research": True,
+        "voice_chat": True,
+    }
+    default_workflows = [
+        ("nearby_visit", "Nearby Visit", "Recover field time by finding useful nearby customer stops.", ["who can I visit near me", "nearby customers", "meeting cancelled"], ["Resolve effective location", "Query open-opportunity accounts", "Rank by distance and pipeline", "Return contact and opportunity context"], ["location", "Salesforce"], 0, 1),
+        ("pre_meeting", "Pre-Meeting Brief", "Build a concise briefing before an upcoming customer meeting.", ["prepare me for", "brief me before", "meeting prep"], ["Resolve Event", "Load Account and Opportunity", "Load primary contacts", "Review Events and Tasks", "Optional public web research", "Generate briefing"], ["Salesforce", "web_search"], 0, 1),
+        ("opp_risk", "Opportunity Risk Review", "Review deal signals, forecast consistency, activity and next steps.", ["deal risk", "what should I worry about", "forecast risk"], ["Query relevant Opportunities", "Review forecast/confidence", "Review activity", "Highlight inconsistencies", "Recommend next actions"], ["Salesforce"], 0, 1),
+        ("competitive_scan", "Competitive Scan", "Combine CRM context with current public competitor research.", ["competitor", "competitive research", "how do we win"], ["Load Opportunity context", "Search public sources", "Compare competitor position", "Build win strategy"], ["Salesforce", "web_search"], 0, 1),
+        ("follow_up", "Follow-Up Assistant", "Turn meeting context into a clean follow-up plan.", ["follow up", "what should I send", "after the meeting"], ["Load latest Session/Event", "Extract commitments", "Draft follow-up", "Propose CRM action if requested"], ["Salesforce", "Sessions"], 1, 1),
+        ("quarter_rescue", "Quarter Rescue", "Surface risky high-value deals that can still be influenced this quarter.", ["quarter rescue", "save the quarter", "what can still close"], ["Query open quarter pipeline", "Rank by value and risk", "Review activity and confidence", "Recommend priorities"], ["Salesforce"], 0, 0),
+    ]
+    default_jargon = [
+        ("cmd", "CMD", ["chromatography and mass spectrometry division"], "C M D", "Organization", "Chromatography and Mass Spectrometry Division"),
+        ("tss", "TSS", ["technical sales specialist"], "T S S", "Role", "Technical Sales Specialist"),
+        ("am", "AM", ["account manager"], "A M", "Role", "Account Manager"),
+        ("dm", "DM", ["district manager"], "D M", "Role", "District Manager"),
+        ("pn", "PN", ["project number", "sfdc project number"], "P N", "Salesforce", "SFDC Project Number generated on the Opportunity"),
+        ("astral", "Astral", ["orbitrap astral"], "ass-truhl", "Product", "Orbitrap Astral mass spectrometer family"),
+        ("excedion", "Excedion", ["exceedion", "excedian", "exceed ian"], "ex-see-dee-on", "Product", "Orbitrap Excedion mass spectrometer family"),
+        ("vanquish", "Vanquish", ["vanquish neo"], "van-kwish", "Product", "Vanquish liquid chromatography platform"),
+        ("faims", "FAIMS", ["faims pro", "fames"], "fames", "Product", "High-field asymmetric waveform ion mobility separation"),
+        ("hram", "HRAM", ["high resolution accurate mass"], "H ram", "Technical", "High-resolution accurate-mass mass spectrometry"),
+    ]
+    default_knowledge = [
+        ("forecast_commit", "Commit", "Forecast", "Demo interpretation: a deal the rep expects to close in the forecast period; treat Stage, Confidence Level and Add to Forecast as separate signals rather than synonyms."),
+        ("forecast_best_case", "Best Case", "Forecast", "Demo interpretation: a strong opportunity that may close in the forecast period but is not yet a Commit."),
+        ("stale_rule", "Stale Opportunity", "Business Rule", "For demo analysis, a useful risk signal is an open Opportunity whose close date is approaching while meaningful customer activity or next-step evidence is old or missing. Do not silently impose a fixed threshold unless the user asks or a workflow defines one."),
+        ("truth_boundary", "Demo Data Boundary", "Safety", "Organizations and public professional identities in the pilot dataset may be real/public. Opportunity values, buying intent, activities, comments and commercial history are synthetic demo data and must never be presented as real confidential intelligence outside Salesforce demo context."),
+    ]
+    with session_db() as conn:
+        for key, enabled in default_flags.items():
+            conn.execute("INSERT OR IGNORE INTO config_feature_flags(key, enabled, updated_at) VALUES(?,?,?)", (key, int(enabled), now))
+        for wid, name, desc, triggers, steps, tools, confirm, enabled in default_workflows:
+            conn.execute("""INSERT OR IGNORE INTO config_workflows
+                (id,name,description,triggers_json,steps_json,tools_json,confirmation_required,enabled,version,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,1,?,?)""", (wid,name,desc,json.dumps(triggers),json.dumps(steps),json.dumps(tools),confirm,enabled,now,now))
+        for jid, term, aliases, pronunciation, category, definition in default_jargon:
+            conn.execute("""INSERT OR IGNORE INTO config_jargon
+                (id,term,aliases_json,pronunciation,category,definition,examples,stt_priority,enabled,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,1,?,?)""", (jid,term,json.dumps(aliases),pronunciation,category,definition,"","normal",now,now))
+        for kid,title,category,content in default_knowledge:
+            conn.execute("""INSERT OR IGNORE INTO config_knowledge
+                (id,title,category,content,enabled,created_at,updated_at) VALUES(?,?,?,?,1,?,?)""", (kid,title,category,content,now,now))
         conn.commit()
 
 
 init_session_db()
+seed_demo_admin_config()
 
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def audit_log(event_type, owner_oid=None, salesforce_username=None, request_id=None, summary=None, details=None):
+    try:
+        with session_db() as conn:
+            conn.execute(
+                """INSERT INTO audit_events
+                (created_at,event_type,owner_oid,salesforce_username,request_id,summary,details_json)
+                VALUES(?,?,?,?,?,?,?)""",
+                (utc_now_iso(), str(event_type), owner_oid, salesforce_username, request_id,
+                 (str(summary)[:500] if summary else None),
+                 json.dumps(details or {}, default=str)[:12000]),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_feature_flags():
+    with session_db() as conn:
+        rows = conn.execute("SELECT key, enabled FROM config_feature_flags ORDER BY key").fetchall()
+    return {row["key"]: bool(row["enabled"]) for row in rows}
+
+
+def get_config_setting(key, default=None):
+    with session_db() as conn:
+        row = conn.execute("SELECT value_json FROM config_settings WHERE key=?", (str(key),)).fetchone()
+    if not row or row["value_json"] is None:
+        return default
+    try:
+        return json.loads(row["value_json"])
+    except Exception:
+        return default
+
+
+def set_config_setting(key, value):
+    with session_db() as conn:
+        conn.execute(
+            "INSERT INTO config_settings(key,value_json,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+            (str(key), json.dumps(value), utc_now_iso()),
+        )
+        conn.commit()
+
+
+def feature_enabled(key, default=True):
+    flags = get_feature_flags()
+    return flags.get(key, default)
+
+
+def get_active_workflows():
+    with session_db() as conn:
+        rows = conn.execute("SELECT * FROM config_workflows WHERE enabled=1 ORDER BY name").fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["triggers"] = json.loads(d.pop("triggers_json") or "[]")
+        d["steps"] = json.loads(d.pop("steps_json") or "[]")
+        d["tools"] = json.loads(d.pop("tools_json") or "[]")
+        d["enabled"] = bool(d["enabled"])
+        d["confirmation_required"] = bool(d["confirmation_required"])
+        out.append(d)
+    return out
+
+
+def get_active_jargon():
+    with session_db() as conn:
+        rows = conn.execute("SELECT * FROM config_jargon WHERE enabled=1 ORDER BY term").fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["aliases"] = json.loads(d.pop("aliases_json") or "[]")
+        d["enabled"] = bool(d["enabled"])
+        out.append(d)
+    return out
+
+
+def get_active_knowledge():
+    with session_db() as conn:
+        rows = conn.execute("SELECT * FROM config_knowledge WHERE enabled=1 ORDER BY category,title").fetchall()
+    return [dict(row) for row in rows]
+
+
+def configurable_context_prompt():
+    workflows = get_active_workflows()[:30]
+    jargon = get_active_jargon()[:200]
+    knowledge = get_active_knowledge()[:100]
+    payload = {
+        "configured_workflows": [
+            {"id": w["id"], "name": w["name"], "description": w["description"],
+             "triggers": w["triggers"], "steps": w["steps"], "tools": w["tools"],
+             "confirmation_required": w["confirmation_required"]}
+            for w in workflows
+        ],
+        "client_jargon": [
+            {"term": j["term"], "aliases": j["aliases"], "definition": j["definition"],
+             "category": j.get("category"), "pronunciation": j.get("pronunciation")}
+            for j in jargon
+        ],
+        "client_knowledge": [
+            {"title": k["title"], "category": k.get("category"), "content": k["content"]}
+            for k in knowledge
+        ],
+    }
+    return (
+        "Client-configured demo context follows. Treat it as organization-specific guidance, "
+        "not as proof of live Salesforce facts. Use a configured workflow when the user's intent "
+        "clearly matches it. Jargon aliases may be used to normalize likely speech/transcription variants.\n"
+        + json.dumps(payload, default=str)[:30000]
+    )
+
+
+def client_speech_context():
+    """Return a compact list of active client terms/aliases for on-device STT hints."""
+    values = []
+    seen = set()
+    for entry in get_active_jargon():
+        candidates = [entry.get("term"), *(entry.get("aliases") or [])]
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            key = value.lower()
+            if value and key not in seen:
+                seen.add(key)
+                values.append(value)
+            if len(values) >= 250:
+                return values
+    return values
+
+
+def apply_jargon_normalization(text):
+    value = str(text or "")
+    if not value:
+        return value
+    replacements = []
+    for entry in get_active_jargon():
+        term = str(entry.get("term") or "").strip()
+        if not term:
+            continue
+        for alias in entry.get("aliases") or []:
+            alias = str(alias or "").strip()
+            if len(alias) >= 3 and alias.lower() != term.lower():
+                replacements.append((alias, term))
+    replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
+    for alias, term in replacements:
+        value = re.sub(r"(?i)(?<![A-Za-z0-9])" + re.escape(alias) + r"(?![A-Za-z0-9])", term, value)
+    return value
 
 
 def safe_session_id(value):
@@ -149,7 +454,7 @@ def safe_session_id(value):
 def owner_session_row(session_id, owner_oid):
     with session_db() as conn:
         row = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ? AND owner_oid = ?",
+            "SELECT * FROM sessions WHERE session_id = ? AND owner_oid = ? AND deleted_at IS NULL",
             (safe_session_id(session_id), str(owner_oid)),
         ).fetchone()
     if not row:
@@ -211,6 +516,8 @@ def session_row_to_dict(row, include_summary=True):
         ),
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
+        "deleted_at": data.get("deleted_at"),
+        "deleted_by": data.get("deleted_by"),
     }
     if include_summary:
         result["summary"] = summary or None
@@ -598,6 +905,13 @@ DEMO_GEO_CENTERS = [
     {"key": "sf", "label": "San Francisco, CA", "latitude": 37.7749, "longitude": -122.4194},
 ]
 
+DEMO_FORCE_CENTERS = DEMO_GEO_CENTERS + [
+    {"key": "houston", "label": "Houston, TX", "latitude": 29.7604, "longitude": -95.3698},
+    {"key": "austin", "label": "Austin, TX", "latitude": 30.2672, "longitude": -97.7431},
+    {"key": "sandiego", "label": "San Diego, CA", "latitude": 32.7157, "longitude": -117.1611},
+    {"key": "losangeles", "label": "Los Angeles, CA", "latitude": 34.0522, "longitude": -118.2437},
+]
+
 DEMO_CITY_COORDS = {
     ("dallas", "tx"): (32.7767, -96.7970),
     ("austin", "tx"): (30.2672, -97.7431),
@@ -745,10 +1059,32 @@ def resolve_location_context(sf, salesforce_username, client_context, claims=Non
             for row in account_rows
         )
 
-    use_demo = bool(DEMO_GEO_ENABLED and (nearest_distance is None or nearest_distance > DEMO_GEO_REAL_RADIUS_KM))
+    use_demo = bool(feature_enabled("demo_geography", DEMO_GEO_ENABLED) and (nearest_distance is None or nearest_distance > DEMO_GEO_REAL_RADIUS_KM))
     if use_demo:
-        stable_key = (client_context or {}).get("geo_session_id") or (claims or {}).get("oid") or salesforce_username
-        effective = choose_demo_cluster(account_rows, stable_key)
+        forced_cluster = get_config_setting("demo_geo_force_cluster", "automatic")
+        if forced_cluster and forced_cluster != "automatic":
+            center = next((c for c in DEMO_FORCE_CENTERS if c["key"] == forced_cluster), None)
+            if center:
+                matching = []
+                for row in account_rows:
+                    lat, lon = row["coords"]
+                    closest = min(DEMO_FORCE_CENTERS, key=lambda c: haversine_km(lat, lon, c["latitude"], c["longitude"]))
+                    if closest["key"] == forced_cluster:
+                        matching.append(row)
+                if matching:
+                    effective = {
+                        "latitude": sum(r["coords"][0] for r in matching) / len(matching),
+                        "longitude": sum(r["coords"][1] for r in matching) / len(matching),
+                        "label": center["label"], "cluster": center["key"],
+                    }
+                else:
+                    effective = {"latitude": center["latitude"], "longitude": center["longitude"], "label": center["label"], "cluster": center["key"]}
+            else:
+                stable_key = (client_context or {}).get("geo_session_id") or (claims or {}).get("oid") or salesforce_username
+                effective = choose_demo_cluster(account_rows, stable_key)
+        else:
+            stable_key = (client_context or {}).get("geo_session_id") or (claims or {}).get("oid") or salesforce_username
+            effective = choose_demo_cluster(account_rows, stable_key)
         effective["country"] = "USA"
         mode = "demo"
     else:
@@ -762,7 +1098,7 @@ def resolve_location_context(sf, salesforce_username, client_context, claims=Non
 
     return {
         "mode": mode,
-        "demo_enabled": DEMO_GEO_ENABLED,
+        "demo_enabled": feature_enabled("demo_geography", DEMO_GEO_ENABLED),
         "actual": actual,
         "effective": effective,
         "nearest_scoped_account_km_from_actual": (
@@ -879,79 +1215,18 @@ def tool_find_nearby_accounts(sf, salesforce_username, args, location_context):
 # ============================================================
 
 def tool_search_opportunities(sf, salesforce_username, args):
+    """Safe, Salesforce-native Opportunity query planner.
+
+    Luna chooses structured filters/sort/aggregation; the backend owns SOQL.
+    This deliberately does not accept raw SOQL from the model.
+    """
     username = soql_escape(salesforce_username)
     status = args.get("status", "all")
     limit = clamp_limit(args.get("limit"), default=25)
     include_contacts = bool(args.get("include_contacts"))
-
-    fields = [
-        "Id",
-        "Name",
-        "StageName",
-        "Amount",
-        "CloseDate",
-        "Probability",
-        "NextStep",
-        "Type",
-        "LeadSource",
-        "ForecastCategoryName",
-        "Description",
-        "IsClosed",
-        "IsWon",
-        "AccountId",
-
-        "Account.Id",
-        "Account.Name",
-        "Account.Industry",
-        "Account.Website",
-        "Account.Phone",
-
-        "Account.BillingStreet",
-        "Account.BillingCity",
-        "Account.BillingState",
-        "Account.BillingPostalCode",
-        "Account.BillingCountry",
-        "Account.BillingLatitude",
-        "Account.BillingLongitude",
-
-        "Account.ShippingStreet",
-        "Account.ShippingCity",
-        "Account.ShippingState",
-        "Account.ShippingPostalCode",
-        "Account.ShippingCountry",
-        "Account.ShippingLatitude",
-        "Account.ShippingLongitude",
-    ]
-
-    if include_contacts:
-        fields.append(
-            """
-            (
-                SELECT
-                    Id,
-                    ContactId,
-                    Role,
-                    IsPrimary,
-                    Contact.Id,
-                    Contact.FirstName,
-                    Contact.LastName,
-                    Contact.Name,
-                    Contact.Title,
-                    Contact.Department,
-                    Contact.Email,
-                    Contact.Phone,
-                    Contact.MobilePhone,
-                    Contact.MailingStreet,
-                    Contact.MailingCity,
-                    Contact.MailingState,
-                    Contact.MailingPostalCode,
-                    Contact.MailingCountry,
-                    Contact.MailingLatitude,
-                    Contact.MailingLongitude
-                FROM OpportunityContactRoles
-            )
-            """
-        )
+    include_comments = bool(args.get("include_comments"))
+    aggregate = args.get("aggregate") or "none"
+    group_by = args.get("group_by") or "none"
 
     where = [f"Owner.Username = '{username}'"]
 
@@ -962,99 +1237,165 @@ def tool_search_opportunities(sf, salesforce_username, args):
     elif status == "closed_lost":
         where.append("IsClosed = true AND IsWon = false")
 
+    if args.get("overdue"):
+        where.append("IsClosed = false")
+        where.append("CloseDate < TODAY")
+
     if args.get("name_contains"):
-        value = soql_like_escape(args["name_contains"])
-        where.append(f"Name LIKE '%{value}%'")
-
+        where.append(f"Name LIKE '%{soql_like_escape(args['name_contains'])}%'")
     if args.get("account_name_contains"):
-        value = soql_like_escape(args["account_name_contains"])
-        where.append(f"Account.Name LIKE '%{value}%'")
-
+        where.append(f"Account.Name LIKE '%{soql_like_escape(args['account_name_contains'])}%'")
     if args.get("stage"):
-        value = soql_escape(args["stage"])
-        where.append(f"StageName = '{value}'")
-
+        where.append(f"StageName = '{soql_escape(args['stage'])}'")
+    if args.get("stage_in"):
+        vals = [f"'{soql_escape(v)}'" for v in args.get("stage_in") if v]
+        if vals:
+            where.append("StageName IN (" + ",".join(vals) + ")")
+    if args.get("add_to_forecast"):
+        where.append(f"Add_to_Forecast__c = '{soql_escape(args['add_to_forecast'])}'")
+    if args.get("confidence_levels"):
+        vals = [f"'{soql_escape(v)}'" for v in args.get("confidence_levels") if v]
+        if vals:
+            where.append("Confidence_Level__c IN (" + ",".join(vals) + ")")
+    if args.get("primary_product_contains"):
+        where.append(f"Primary_Product__c LIKE '%{soql_like_escape(args['primary_product_contains'])}%'")
     if args.get("min_amount") is not None:
         where.append(f"Amount >= {float(args['min_amount'])}")
-
     if args.get("max_amount") is not None:
         where.append(f"Amount <= {float(args['max_amount'])}")
 
-    if args.get("close_date_from"):
-        value = validate_iso_date(args["close_date_from"])
-        where.append(f"CloseDate >= {value}")
-
-    if args.get("close_date_to"):
-        value = validate_iso_date(args["close_date_to"])
-        where.append(f"CloseDate <= {value}")
+    relative = args.get("close_date_relative")
+    allowed_relative = {
+        "YESTERDAY", "TODAY", "TOMORROW", "LAST_WEEK", "THIS_WEEK", "NEXT_WEEK",
+        "LAST_MONTH", "THIS_MONTH", "NEXT_MONTH", "LAST_QUARTER", "THIS_QUARTER",
+        "NEXT_QUARTER", "LAST_YEAR", "THIS_YEAR", "NEXT_YEAR",
+    }
+    if relative:
+        if relative not in allowed_relative:
+            raise ValueError("Unsupported Salesforce relative date literal.")
+        where.append(f"CloseDate = {relative}")
+    else:
+        if args.get("close_date_from"):
+            where.append(f"CloseDate >= {validate_iso_date(args['close_date_from'])}")
+        if args.get("close_date_to"):
+            where.append(f"CloseDate <= {validate_iso_date(args['close_date_to'])}")
 
     if args.get("account_city"):
-        value = soql_escape(args["account_city"])
-        where.append(f"Account.BillingCity = '{value}'")
-
+        where.append(f"Account.BillingCity = '{soql_escape(args['account_city'])}'")
     if args.get("account_state"):
-        value = soql_escape(args["account_state"])
-        where.append(f"Account.BillingState = '{value}'")
-
+        state = str(args["account_state"]).strip()
+        if re.fullmatch(r"[A-Za-z]{2}", state):
+            where.append(f"Account.BillingStateCode = '{soql_escape(state.upper())}'")
+        else:
+            where.append(f"Account.BillingState = '{soql_escape(state)}'")
     if args.get("account_country"):
-        value = soql_escape(args["account_country"])
-        where.append(f"Account.BillingCountry = '{value}'")
+        country = str(args["account_country"]).strip()
+        if len(country) == 2:
+            where.append(f"Account.BillingCountryCode = '{soql_escape(country.upper())}'")
+        else:
+            where.append(f"Account.BillingCountry = '{soql_escape(country)}'")
 
-    soql = (
-        "SELECT "
-        + ", ".join(fields)
-        + " FROM Opportunity "
-        + "WHERE "
-        + " AND ".join(where)
-        + " ORDER BY CloseDate ASC "
-        + f"LIMIT {limit}"
-    )
+    if aggregate != "none":
+        aggregate_map = {
+            "count": "COUNT(Id)",
+            "sum_amount": "SUM(Amount)",
+            "avg_amount": "AVG(Amount)",
+            "max_amount": "MAX(Amount)",
+            "min_amount": "MIN(Amount)",
+        }
+        group_map = {
+            "stage": "StageName",
+            "account": "Account.Name",
+            "state": "Account.BillingState",
+            "add_to_forecast": "Add_to_Forecast__c",
+            "confidence": "Confidence_Level__c",
+            "primary_product": "Primary_Product__c",
+        }
+        if aggregate not in aggregate_map:
+            raise ValueError("Unsupported Opportunity aggregation.")
+        group_field = group_map.get(group_by)
+        select_parts = []
+        if group_field:
+            select_parts.append(group_field)
+        select_parts.append(aggregate_map[aggregate])
+        soql = "SELECT " + ", ".join(select_parts) + " FROM Opportunity WHERE " + " AND ".join(where)
+        if group_field:
+            soql += f" GROUP BY {group_field}"
+        soql += f" LIMIT {limit}"
+        data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+        rows = []
+        for row in data.get("records", []):
+            if group_field == "Account.Name":
+                group_value = (row.get("Account") or {}).get("Name")
+            else:
+                group_value = row.get(group_field) if group_field else None
+            rows.append({
+                "group": group_value,
+                "value": row.get("expr0"),
+                "aggregate": aggregate,
+            })
+        return {"ok": True, "count": len(rows), "aggregate": aggregate, "group_by": group_by, "summary_rows": rows}
 
-    data = salesforce_query(
-        sf["access_token"],
-        sf["instance_url"],
-        soql,
-    )
+    fields = [
+        "Id", "Name", "StageName", "Amount", "CloseDate", "Probability", "NextStep",
+        "Type", "LeadSource", "ForecastCategoryName", "Description", "IsClosed", "IsWon",
+        "LastActivityDate", "AccountId", "SFDC_Project_No__c", "Primary_Product__c",
+        "Confidence_Level__c", "Add_to_Forecast__c",
+        "Account.Id", "Account.Name", "Account.Industry", "Account.Website", "Account.Phone",
+        "Account.BillingStreet", "Account.BillingCity", "Account.BillingState", "Account.BillingStateCode",
+        "Account.BillingPostalCode", "Account.BillingCountry", "Account.BillingCountryCode",
+        "Account.BillingLatitude", "Account.BillingLongitude", "Account.ShippingStreet",
+        "Account.ShippingCity", "Account.ShippingState", "Account.ShippingPostalCode",
+        "Account.ShippingCountry", "Account.ShippingLatitude", "Account.ShippingLongitude",
+    ]
+    if include_comments:
+        fields.append("Comments__c")
+    if include_contacts:
+        fields.append("""(
+            SELECT Id, ContactId, Role, IsPrimary, Contact.Id, Contact.FirstName, Contact.LastName,
+                   Contact.Name, Contact.Title, Contact.Department, Contact.Email, Contact.Phone,
+                   Contact.MobilePhone, Contact.MailingStreet, Contact.MailingCity, Contact.MailingState,
+                   Contact.MailingPostalCode, Contact.MailingCountry, Contact.MailingLatitude,
+                   Contact.MailingLongitude
+            FROM OpportunityContactRoles
+        )""")
 
+    sort_map = {
+        "close_date": "CloseDate", "amount": "Amount", "name": "Name", "stage": "StageName",
+        "last_activity": "LastActivityDate", "confidence": "Confidence_Level__c",
+    }
+    sort_field = sort_map.get(args.get("sort_by") or "close_date", "CloseDate")
+    direction = "DESC" if str(args.get("sort_direction") or "ASC").upper() == "DESC" else "ASC"
+    soql = "SELECT " + ", ".join(fields) + " FROM Opportunity WHERE " + " AND ".join(where)
+    soql += f" ORDER BY {sort_field} {direction} NULLS LAST LIMIT {limit}"
+
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
     opportunities = []
-
     for row in data.get("records", []):
         contacts = []
-
         if include_contacts:
             contact_roles = row.get("OpportunityContactRoles") or {}
-
             for role in contact_roles.get("records", []):
                 contacts.append({
                     "role": role.get("Role"),
                     "is_primary": role.get("IsPrimary"),
                     "contact": format_contact(role.get("Contact")),
                 })
+            contacts.sort(key=lambda role: (not bool(role.get("is_primary")), str((role.get("contact") or {}).get("name") or "")))
 
         opportunities.append({
-            "id": row.get("Id"),
-            "name": row.get("Name"),
-            "stage": row.get("StageName"),
-            "amount": row.get("Amount"),
-            "close_date": row.get("CloseDate"),
-            "probability": row.get("Probability"),
-            "next_step": row.get("NextStep"),
-            "type": row.get("Type"),
-            "lead_source": row.get("LeadSource"),
-            "forecast_category": row.get("ForecastCategoryName"),
-            "description": row.get("Description"),
-            "is_closed": row.get("IsClosed"),
-            "is_won": row.get("IsWon"),
-            "account": format_account(row.get("Account")),
-            "contacts": contacts,
+            "id": row.get("Id"), "name": row.get("Name"), "project_number": row.get("SFDC_Project_No__c"),
+            "stage": row.get("StageName"), "amount": row.get("Amount"), "close_date": row.get("CloseDate"),
+            "probability": row.get("Probability"), "confidence_level": row.get("Confidence_Level__c"),
+            "add_to_forecast": row.get("Add_to_Forecast__c"), "primary_product": row.get("Primary_Product__c"),
+            "next_step": row.get("NextStep"), "type": row.get("Type"), "lead_source": row.get("LeadSource"),
+            "forecast_category": row.get("ForecastCategoryName"), "description": row.get("Description"),
+            "comments": row.get("Comments__c") if include_comments else None,
+            "last_activity_date": row.get("LastActivityDate"), "is_closed": row.get("IsClosed"),
+            "is_won": row.get("IsWon"), "account": format_account(row.get("Account")), "contacts": contacts,
+            "primary_contact": next((r.get("contact") for r in contacts if r.get("is_primary")), None),
         })
-
-    return {
-        "ok": True,
-        "count": len(opportunities),
-        "opportunities": opportunities,
-    }
-
+    return {"ok": True, "count": len(opportunities), "opportunities": opportunities}
 
 def tool_search_contacts(sf, salesforce_username, args):
     username = soql_escape(salesforce_username)
@@ -1297,57 +1638,40 @@ def tool_search_events(sf, salesforce_username, args):
     username = soql_escape(salesforce_username)
     limit = clamp_limit(args.get("limit"), default=25)
     related_name = (args.get("related_name_contains") or "").strip().lower()
-
-    # If we need to filter a polymorphic related-name in Python, fetch a slightly
-    # larger safe window and then trim back to the requested limit.
     query_limit = min(100, max(limit, 75 if related_name else limit))
 
     fields = [
-        "Id",
-        "Subject",
-        "StartDateTime",
-        "EndDateTime",
-        "ActivityDate",
-        "IsAllDayEvent",
-        "Location",
-        "Description",
-        "WhoId",
-        "WhatId",
-        "Who.Name",
-        "What.Name",
-        "OwnerId",
-        "Owner.Name",
-        "Owner.Username",
+        "Id", "Subject", "StartDateTime", "EndDateTime", "ActivityDate", "IsAllDayEvent",
+        "Location", "Description", "WhoId", "WhatId", "Who.Name", "What.Name",
+        "OwnerId", "Owner.Name", "Owner.Username",
     ]
-
     where = [f"Owner.Username = '{username}'"]
-
-    if args.get("start_datetime_from"):
-        where.append(
-            "StartDateTime >= " + salesforce_soql_datetime(args["start_datetime_from"])
-        )
-
-    if args.get("start_datetime_to"):
-        where.append(
-            "StartDateTime <= " + salesforce_soql_datetime(args["start_datetime_to"])
-        )
-
+    relative = args.get("start_relative")
+    allowed_relative = {
+        "YESTERDAY", "TODAY", "TOMORROW", "LAST_WEEK", "THIS_WEEK", "NEXT_WEEK",
+        "LAST_MONTH", "THIS_MONTH", "NEXT_MONTH", "LAST_QUARTER", "THIS_QUARTER",
+        "NEXT_QUARTER", "LAST_YEAR", "THIS_YEAR", "NEXT_YEAR",
+    }
+    if relative:
+        if relative not in allowed_relative:
+            raise ValueError("Unsupported Salesforce relative date literal.")
+        where.append(f"StartDateTime = {relative}")
+    else:
+        if args.get("start_datetime_from"):
+            where.append("StartDateTime >= " + salesforce_soql_datetime(args["start_datetime_from"]))
+        if args.get("start_datetime_to"):
+            where.append("StartDateTime <= " + salesforce_soql_datetime(args["start_datetime_to"]))
+    if args.get("time_scope") == "upcoming":
+        where.append("StartDateTime >= TODAY")
+    elif args.get("time_scope") == "past":
+        where.append("StartDateTime < TODAY")
     if args.get("subject_contains"):
-        value = soql_like_escape(args["subject_contains"])
-        where.append(f"Subject LIKE '%{value}%'")
+        where.append(f"Subject LIKE '%{soql_like_escape(args['subject_contains'])}%'")
 
-    soql = (
-        "SELECT "
-        + ", ".join(fields)
-        + " FROM Event WHERE "
-        + " AND ".join(where)
-        + " ORDER BY StartDateTime ASC "
-        + f"LIMIT {query_limit}"
-    )
-
+    soql = "SELECT " + ", ".join(fields) + " FROM Event WHERE " + " AND ".join(where)
+    soql += f" ORDER BY StartDateTime ASC LIMIT {query_limit}"
     data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
     events = [format_event(row) for row in data.get("records", [])]
-
     if related_name:
         events = [
             event for event in events
@@ -1355,15 +1679,91 @@ def tool_search_events(sf, salesforce_username, args):
             or related_name in str((event.get("what") or {}).get("name") or "").lower()
             or related_name in str(event.get("subject") or "").lower()
         ]
+    return {"ok": True, "count": len(events[:limit]), "events": events[:limit]}
 
-    events = events[:limit]
 
+def format_task(row):
+    if not row:
+        return None
+    who_id = row.get("WhoId")
+    what_id = row.get("WhatId")
     return {
-        "ok": True,
-        "count": len(events),
-        "events": events,
+        "id": row.get("Id"),
+        "subject": row.get("Subject"),
+        "activity_date": row.get("ActivityDate"),
+        "status": row.get("Status"),
+        "priority": row.get("Priority"),
+        "description": row.get("Description"),
+        "is_closed": row.get("IsClosed"),
+        "who": {"id": who_id, "name": (row.get("Who") or {}).get("Name"), "type": salesforce_object_type_from_id(who_id)} if who_id else None,
+        "what": {"id": what_id, "name": (row.get("What") or {}).get("Name"), "type": salesforce_object_type_from_id(what_id)} if what_id else None,
+        "owner": {"id": row.get("OwnerId"), "name": (row.get("Owner") or {}).get("Name"), "username": (row.get("Owner") or {}).get("Username")},
     }
 
+
+def tool_search_tasks(sf, salesforce_username, args):
+    username = soql_escape(salesforce_username)
+    limit = clamp_limit(args.get("limit"), default=25)
+    related_name = (args.get("related_name_contains") or "").strip().lower()
+    query_limit = min(100, max(limit, 75 if related_name else limit))
+    fields = ["Id", "Subject", "ActivityDate", "Status", "Priority", "Description", "IsClosed", "WhoId", "WhatId", "Who.Name", "What.Name", "OwnerId", "Owner.Name", "Owner.Username"]
+    where = [f"Owner.Username = '{username}'"]
+    task_status = args.get("task_status") or "all"
+    if task_status == "open": where.append("IsClosed = false")
+    elif task_status == "completed": where.append("IsClosed = true")
+    if args.get("overdue"):
+        where.extend(["IsClosed = false", "ActivityDate < TODAY"])
+    relative = args.get("date_relative")
+    allowed_relative = {"YESTERDAY", "TODAY", "TOMORROW", "LAST_WEEK", "THIS_WEEK", "NEXT_WEEK", "LAST_MONTH", "THIS_MONTH", "NEXT_MONTH", "LAST_QUARTER", "THIS_QUARTER", "NEXT_QUARTER", "LAST_YEAR", "THIS_YEAR", "NEXT_YEAR"}
+    if relative:
+        if relative not in allowed_relative: raise ValueError("Unsupported Salesforce relative date literal.")
+        where.append(f"ActivityDate = {relative}")
+    else:
+        if args.get("date_from"): where.append(f"ActivityDate >= {validate_iso_date(args['date_from'])}")
+        if args.get("date_to"): where.append(f"ActivityDate <= {validate_iso_date(args['date_to'])}")
+    if args.get("subject_contains"):
+        where.append(f"Subject LIKE '%{soql_like_escape(args['subject_contains'])}%'")
+    soql = "SELECT " + ", ".join(fields) + " FROM Task WHERE " + " AND ".join(where) + f" ORDER BY ActivityDate ASC NULLS LAST LIMIT {query_limit}"
+    data = salesforce_query(sf["access_token"], sf["instance_url"], soql)
+    tasks = [format_task(row) for row in data.get("records", [])]
+    if related_name:
+        tasks = [t for t in tasks if related_name in str((t.get("who") or {}).get("name") or "").lower() or related_name in str((t.get("what") or {}).get("name") or "").lower() or related_name in str(t.get("subject") or "").lower()]
+    return {"ok": True, "count": len(tasks[:limit]), "tasks": tasks[:limit]}
+
+
+def tool_get_opportunity_context(sf, salesforce_username, args):
+    opp_id = str(args.get("opportunity_id") or "").strip()
+    if not re.fullmatch(r"006[A-Za-z0-9]{12,15}", opp_id):
+        raise ValueError("A valid Salesforce Opportunity Id is required.")
+    safe_username = soql_escape(salesforce_username)
+    safe_id = soql_escape(opp_id)
+    soql = f"""SELECT Id,Name,SFDC_Project_No__c,StageName,Amount,CloseDate,Probability,NextStep,
+        ForecastCategoryName,Primary_Product__c,Confidence_Level__c,Add_to_Forecast__c,Comments__c,
+        Description,LastActivityDate,IsClosed,IsWon,Account.Id,Account.Name,Account.Industry,Account.Website,
+        Account.Phone,Account.BillingStreet,Account.BillingCity,Account.BillingState,Account.BillingStateCode,
+        Account.BillingPostalCode,Account.BillingCountry,Account.BillingLatitude,Account.BillingLongitude,
+        (SELECT Id,Role,IsPrimary,Contact.Id,Contact.Name,Contact.Title,Contact.Department,Contact.Email,Contact.Phone,Contact.MobilePhone FROM OpportunityContactRoles)
+        FROM Opportunity WHERE Id='{safe_id}' AND Owner.Username='{safe_username}' LIMIT 1"""
+    records = salesforce_query(sf["access_token"], sf["instance_url"], " ".join(soql.split())).get("records", [])
+    if not records: raise ValueError("Opportunity not found in the authenticated user's scope.")
+    row = records[0]
+    roles=[]
+    for role in (row.get("OpportunityContactRoles") or {}).get("records", []):
+        roles.append({"role":role.get("Role"),"is_primary":role.get("IsPrimary"),"contact":format_contact(role.get("Contact"))})
+    roles.sort(key=lambda r:(not bool(r.get("is_primary")), str((r.get("contact") or {}).get("name") or "")))
+    opportunity={
+        "id":row.get("Id"),"name":row.get("Name"),"project_number":row.get("SFDC_Project_No__c"),"stage":row.get("StageName"),
+        "amount":row.get("Amount"),"close_date":row.get("CloseDate"),"probability":row.get("Probability"),"next_step":row.get("NextStep"),
+        "forecast_category":row.get("ForecastCategoryName"),"primary_product":row.get("Primary_Product__c"),"confidence_level":row.get("Confidence_Level__c"),
+        "add_to_forecast":row.get("Add_to_Forecast__c"),"comments":row.get("Comments__c"),"description":row.get("Description"),"last_activity_date":row.get("LastActivityDate"),
+        "is_closed":row.get("IsClosed"),"is_won":row.get("IsWon"),"account":format_account(row.get("Account")),"contacts":roles,
+        "primary_contact":next((r.get("contact") for r in roles if r.get("is_primary")),None),
+    }
+    ev_soql = f"SELECT Id,Subject,StartDateTime,EndDateTime,ActivityDate,IsAllDayEvent,Location,Description,WhoId,WhatId,Who.Name,What.Name,OwnerId,Owner.Name,Owner.Username FROM Event WHERE Owner.Username='{safe_username}' AND WhatId='{safe_id}' ORDER BY StartDateTime DESC LIMIT 75"
+    task_soql = f"SELECT Id,Subject,ActivityDate,Status,Priority,Description,IsClosed,WhoId,WhatId,Who.Name,What.Name,OwnerId,Owner.Name,Owner.Username FROM Task WHERE Owner.Username='{safe_username}' AND WhatId='{safe_id}' ORDER BY ActivityDate DESC NULLS LAST LIMIT 75"
+    events=[format_event(r) for r in salesforce_query(sf["access_token"],sf["instance_url"],ev_soql).get("records",[])]
+    tasks=[format_task(r) for r in salesforce_query(sf["access_token"],sf["instance_url"],task_soql).get("records",[])]
+    return {"ok":True,"count":1,"opportunity":opportunity,"events":events,"tasks":tasks}
 
 def get_scoped_related_record(sf, salesforce_username, record_id, expected_role):
     if not record_id:
@@ -1788,10 +2188,10 @@ CRM_READ_TOOLS = [
         "type": "function",
         "name": "search_opportunities",
         "description": (
-            "Search the authenticated user's Salesforce opportunities. "
-            "Returns opportunity details, customer/account information "
-            "including billing and shipping addresses, and optionally "
-            "contacts through Opportunity Contact Roles."
+            "Run a SAFE Salesforce-native Opportunity query for the authenticated user. "
+            "Use this instead of pulling a broad list into the model. It supports relative Salesforce "
+            "date literals, overdue detection, rich CMD fields, sorting, grouping and aggregation. "
+            "The backend builds SOQL; never invent raw SOQL."
         ),
         "strict": True,
         "parameters": {
@@ -1799,185 +2199,69 @@ CRM_READ_TOOLS = [
             "properties": {
                 "name_contains": {"type": ["string", "null"]},
                 "account_name_contains": {"type": ["string", "null"]},
-                "status": {
-                    "type": "string",
-                    "enum": ["all", "open", "closed_won", "closed_lost"],
-                },
+                "status": {"type": "string", "enum": ["all", "open", "closed_won", "closed_lost"]},
+                "overdue": {"type": "boolean", "description": "Open Opportunities with CloseDate before TODAY."},
                 "stage": {"type": ["string", "null"]},
+                "stage_in": {"type": ["array", "null"], "items": {"type": "string"}},
+                "add_to_forecast": {"type": ["string", "null"], "enum": ["Upside", "In", "Out", None]},
+                "confidence_levels": {"type": ["array", "null"], "items": {"type": "string", "enum": ["0%", "10%", "25%", "50%", "75%", "90%", "100%"]}},
+                "primary_product_contains": {"type": ["string", "null"]},
                 "min_amount": {"type": ["number", "null"]},
                 "max_amount": {"type": ["number", "null"]},
-                "close_date_from": {
-                    "type": ["string", "null"],
-                    "description": "ISO date YYYY-MM-DD.",
-                },
-                "close_date_to": {
-                    "type": ["string", "null"],
-                    "description": "ISO date YYYY-MM-DD.",
-                },
+                "close_date_relative": {"type": ["string", "null"], "enum": ["YESTERDAY", "TODAY", "TOMORROW", "LAST_WEEK", "THIS_WEEK", "NEXT_WEEK", "LAST_MONTH", "THIS_MONTH", "NEXT_MONTH", "LAST_QUARTER", "THIS_QUARTER", "NEXT_QUARTER", "LAST_YEAR", "THIS_YEAR", "NEXT_YEAR", None]},
+                "close_date_from": {"type": ["string", "null"], "description": "ISO date YYYY-MM-DD; use only when a relative date literal is not suitable."},
+                "close_date_to": {"type": ["string", "null"], "description": "ISO date YYYY-MM-DD; use only when a relative date literal is not suitable."},
                 "account_city": {"type": ["string", "null"]},
                 "account_state": {"type": ["string", "null"]},
                 "account_country": {"type": ["string", "null"]},
                 "include_contacts": {"type": "boolean"},
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
+                "include_comments": {"type": "boolean"},
+                "sort_by": {"type": "string", "enum": ["close_date", "amount", "name", "stage", "last_activity", "confidence"]},
+                "sort_direction": {"type": "string", "enum": ["ASC", "DESC"]},
+                "aggregate": {"type": "string", "enum": ["none", "count", "sum_amount", "avg_amount", "max_amount", "min_amount"]},
+                "group_by": {"type": "string", "enum": ["none", "stage", "account", "state", "add_to_forecast", "confidence", "primary_product"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
-            "required": [
-                "name_contains",
-                "account_name_contains",
-                "status",
-                "stage",
-                "min_amount",
-                "max_amount",
-                "close_date_from",
-                "close_date_to",
-                "account_city",
-                "account_state",
-                "account_country",
-                "include_contacts",
-                "limit",
-            ],
-            "additionalProperties": False,
-        },
-    },
-
-    {
-        "type": "function",
-        "name": "search_contacts",
-        "description": (
-            "Search contacts belonging to customer accounts connected "
-            "to opportunities owned by the authenticated Salesforce user. "
-            "Returns title, department, email, phone, mailing address, "
-            "and associated customer/account information."
-        ),
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name_contains": {"type": ["string", "null"]},
-                "title_contains": {"type": ["string", "null"]},
-                "account_name_contains": {"type": ["string", "null"]},
-                "account_city": {"type": ["string", "null"]},
-                "account_state": {"type": ["string", "null"]},
-                "account_country": {"type": ["string", "null"]},
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
-            },
-            "required": [
-                "name_contains",
-                "title_contains",
-                "account_name_contains",
-                "account_city",
-                "account_state",
-                "account_country",
-                "limit",
-            ],
-            "additionalProperties": False,
-        },
-    },
-
-    {
-        "type": "function",
-        "name": "search_accounts",
-        "description": (
-            "Search customer accounts associated with opportunities "
-            "owned by the authenticated Salesforce user. Returns customer "
-            "name, industry, website, phone, billing address, shipping/site "
-            "address, and coordinates when populated."
-        ),
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name_contains": {"type": ["string", "null"]},
-                "industry_contains": {"type": ["string", "null"]},
-                "city": {"type": ["string", "null"]},
-                "state": {"type": ["string", "null"]},
-                "country": {"type": ["string", "null"]},
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
-            },
-            "required": [
-                "name_contains",
-                "industry_contains",
-                "city",
-                "state",
-                "country",
-                "limit",
-            ],
+            "required": ["name_contains", "account_name_contains", "status", "overdue", "stage", "stage_in", "add_to_forecast", "confidence_levels", "primary_product_contains", "min_amount", "max_amount", "close_date_relative", "close_date_from", "close_date_to", "account_city", "account_state", "account_country", "include_contacts", "include_comments", "sort_by", "sort_direction", "aggregate", "group_by", "limit"],
             "additionalProperties": False,
         },
     },
     {
-        "type": "function",
-        "name": "find_nearby_accounts",
-        "description": (
-            "Find customer Accounts with open opportunities near the user's effective current location. "
-            "The backend performs deterministic distance calculations; do not invent geography. "
-            "Use this for nearby customers, unplanned field visits, or a cancelled-meeting recovery workflow."
-        ),
+        "type": "function", "name": "get_opportunity_context",
+        "description": "Load one owned Opportunity with CMD custom fields, primary/secondary Opportunity Contact Roles, Events and Tasks. Use for deal summaries, meeting preparation, history, risk analysis and CRM + web research after an Opportunity id is known.",
         "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "radius_km": {"type": "number", "minimum": 1, "maximum": 300},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 25}
-            },
-            "required": ["radius_km", "limit"],
-            "additionalProperties": False
-        }
+        "parameters": {"type": "object", "properties": {"opportunity_id": {"type": "string"}}, "required": ["opportunity_id"], "additionalProperties": False},
     },
-
     {
-        "type": "function",
-        "name": "search_events",
-        "description": (
-            "Search Salesforce Events owned by the authenticated user. Use this "
-            "for meetings, appointments, scheduled customer visits, and calendar "
-            "questions. Resolve relative dates using the supplied user device time."
-        ),
+        "type": "function", "name": "search_contacts",
+        "description": "Search Contacts belonging to Accounts connected to Opportunities owned by the authenticated Salesforce user. Returns callable phone/mobile fields, email, role/title and Account context.",
         "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start_datetime_from": {
-                    "type": ["string", "null"],
-                    "description": "ISO 8601 date-time with explicit timezone offset.",
-                },
-                "start_datetime_to": {
-                    "type": ["string", "null"],
-                    "description": "ISO 8601 date-time with explicit timezone offset.",
-                },
-                "subject_contains": {"type": ["string", "null"]},
-                "related_name_contains": {
-                    "type": ["string", "null"],
-                    "description": "Contact, Account, Opportunity, or subject name fragment.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                },
-            },
-            "required": [
-                "start_datetime_from",
-                "start_datetime_to",
-                "subject_contains",
-                "related_name_contains",
-                "limit",
-            ],
-            "additionalProperties": False,
-        },
+        "parameters": {"type":"object","properties":{"name_contains":{"type":["string","null"]},"title_contains":{"type":["string","null"]},"account_name_contains":{"type":["string","null"]},"account_city":{"type":["string","null"]},"account_state":{"type":["string","null"]},"account_country":{"type":["string","null"]},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["name_contains","title_contains","account_name_contains","account_city","account_state","account_country","limit"],"additionalProperties":False},
     },
-
+    {
+        "type": "function", "name": "search_accounts",
+        "description": "Search customer Accounts associated with Opportunities owned by the authenticated Salesforce user.",
+        "strict": True,
+        "parameters": {"type":"object","properties":{"name_contains":{"type":["string","null"]},"industry_contains":{"type":["string","null"]},"city":{"type":["string","null"]},"state":{"type":["string","null"]},"country":{"type":["string","null"]},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["name_contains","industry_contains","city","state","country","limit"],"additionalProperties":False},
+    },
+    {
+        "type": "function", "name": "find_nearby_accounts",
+        "description": "Find customer Accounts with open Opportunities near the user's effective location. Backend computes distance deterministically.",
+        "strict": True,
+        "parameters": {"type":"object","properties":{"radius_km":{"type":"number","minimum":1,"maximum":300},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["radius_km","limit"],"additionalProperties":False},
+    },
+    {
+        "type": "function", "name": "search_events",
+        "description": "Query Salesforce Events owned by the authenticated user. Prefer Salesforce relative date literals for this week/month/quarter style calendar questions.",
+        "strict": True,
+        "parameters": {"type":"object","properties":{"start_relative":{"type":["string","null"],"enum":["YESTERDAY","TODAY","TOMORROW","LAST_WEEK","THIS_WEEK","NEXT_WEEK","LAST_MONTH","THIS_MONTH","NEXT_MONTH","LAST_QUARTER","THIS_QUARTER","NEXT_QUARTER","LAST_YEAR","THIS_YEAR","NEXT_YEAR",None]},"time_scope":{"type":"string","enum":["all","upcoming","past"]},"start_datetime_from":{"type":["string","null"]},"start_datetime_to":{"type":["string","null"]},"subject_contains":{"type":["string","null"]},"related_name_contains":{"type":["string","null"]},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["start_relative","time_scope","start_datetime_from","start_datetime_to","subject_contains","related_name_contains","limit"],"additionalProperties":False},
+    },
+    {
+        "type": "function", "name": "search_tasks",
+        "description": "Query Salesforce Tasks owned by the authenticated user, including open/completed/overdue Tasks and Salesforce relative date periods.",
+        "strict": True,
+        "parameters": {"type":"object","properties":{"task_status":{"type":"string","enum":["all","open","completed"]},"overdue":{"type":"boolean"},"date_relative":{"type":["string","null"],"enum":["YESTERDAY","TODAY","TOMORROW","LAST_WEEK","THIS_WEEK","NEXT_WEEK","LAST_MONTH","THIS_MONTH","NEXT_MONTH","LAST_QUARTER","THIS_QUARTER","NEXT_QUARTER","LAST_YEAR","THIS_YEAR","NEXT_YEAR",None]},"date_from":{"type":["string","null"]},"date_to":{"type":["string","null"]},"subject_contains":{"type":["string","null"]},"related_name_contains":{"type":["string","null"]},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["task_status","overdue","date_relative","date_from","date_to","subject_contains","related_name_contains","limit"],"additionalProperties":False},
+    },
 ]
 
 
@@ -2147,6 +2431,20 @@ def run_function_tool(
                 arguments,
             )
 
+        if tool_name == "search_tasks":
+            return tool_search_tasks(
+                sf,
+                salesforce_username,
+                arguments,
+            )
+
+        if tool_name == "get_opportunity_context":
+            return tool_get_opportunity_context(
+                sf,
+                salesforce_username,
+                arguments,
+            )
+
         if tool_name == "propose_update_opportunity":
             return tool_propose_update_opportunity(
                 sf,
@@ -2184,13 +2482,16 @@ def run_function_tool(
 # CAPABILITY MANIFEST
 # ============================================================
 
-CAPABILITY_MANIFEST = {
+BASE_CAPABILITY_MANIFEST = {
     "salesforce": {
         "search_opportunities": True,
+        "aggregate_opportunities": True,
+        "opportunity_context": True,
         "search_accounts": True,
         "search_contacts": True,
         "update_opportunities": True,
         "search_events": True,
+        "search_tasks": True,
         "create_events": True,
         "update_events": True,
         "create_tasks": False,
@@ -2200,22 +2501,64 @@ CAPABILITY_MANIFEST = {
     "location": {
         "foreground_gps": True,
         "demo_geography_adapter": True,
-        "nearby_accounts": True
+        "nearby_accounts": True,
     },
     "sessions": {
         "iphone_recording": True,
         "background_recording": True,
         "diarized_transcription": True,
         "opportunity_linking": True,
-        "voicepuck": "prototype_not_connected"
+        "soft_delete": True,
+        "voicepuck": "prototype_not_connected",
+    },
+    "voice": {
+        "ask_sally": True,
+    },
+    "research": {
+        "long_research": True,
+    },
+    "mobile_actions": {
+        "call_contact": True,
+    },
+    "admin": {
+        "workflows": True,
+        "jargon": True,
+        "knowledge": True,
+        "operations": True,
     },
 }
+
+
+def current_capabilities():
+    capabilities = json.loads(json.dumps(BASE_CAPABILITY_MANIFEST))
+    flags = get_feature_flags()
+    read_on = flags.get("salesforce_reads", True)
+    write_on = flags.get("salesforce_writes", True)
+    capabilities["salesforce"]["search_opportunities"] = read_on
+    capabilities["salesforce"]["aggregate_opportunities"] = read_on
+    capabilities["salesforce"]["opportunity_context"] = read_on
+    capabilities["salesforce"]["search_accounts"] = read_on
+    capabilities["salesforce"]["search_contacts"] = read_on
+    capabilities["salesforce"]["search_events"] = read_on
+    capabilities["salesforce"]["search_tasks"] = read_on
+    capabilities["salesforce"]["update_opportunities"] = write_on
+    capabilities["salesforce"]["create_events"] = write_on
+    capabilities["salesforce"]["update_events"] = write_on
+    capabilities["web_research"] = flags.get("web_research", True)
+    capabilities["location"]["foreground_gps"] = flags.get("location", True)
+    capabilities["location"]["demo_geography_adapter"] = flags.get("demo_geography", DEMO_GEO_ENABLED)
+    capabilities["sessions"]["iphone_recording"] = flags.get("session_recording", True)
+    capabilities["sessions"]["soft_delete"] = flags.get("session_soft_delete", True)
+    capabilities["voice"]["ask_sally"] = flags.get("voice_chat", True)
+    capabilities["research"]["long_research"] = flags.get("long_research", True)
+    return capabilities
+
 
 
 def capability_prompt():
     return (
         "Available CMD Sally capabilities (authoritative):\n"
-        + json.dumps(CAPABILITY_MANIFEST, indent=2)
+        + json.dumps(current_capabilities(), indent=2)
         + "\nNever claim an unavailable capability exists."
     )
 
@@ -2438,8 +2781,9 @@ SIMPLE
 Use Luna low and answer directly.
 
 CRM_READ
-- Salesforce retrieval/filtering/counting/straightforward summarization.
-- Opportunities, accounts, customers, addresses, contacts, contact roles, Salesforce Events/meetings.
+- Salesforce retrieval/filtering/counting/aggregation/straightforward summarization.
+- Opportunities, accounts, customers, addresses, contacts, contact roles, Salesforce Events/meetings, and Tasks.
+- Questions such as biggest/top deals, closing this week/month/quarter, overdue opportunities, pipeline totals, grouped pipeline, meetings in a period, and overdue Tasks should normally remain CRM_READ because Salesforce performs the filtering/aggregation directly.
 - Nearby customer/account questions that depend on the user's current location.
 Use Luna low. needs_salesforce=true.
 
@@ -2516,6 +2860,8 @@ def route_or_answer(
                     ROUTER_INSTRUCTIONS
                     + "\n\n"
                     + client_time_prompt(client_context)
+                    + "\n\n"
+                    + configurable_context_prompt()
                 ),
             },
             *conversation_items(history, user_message),
@@ -2556,10 +2902,13 @@ Salesforce:
 - The user is authenticated through Microsoft Entra.
 - The backend authenticates to Salesforce as the corresponding Salesforce user.
 - Use Salesforce tools whenever the request depends on CRM data.
+- Prefer Salesforce-native filtering, sorting, relative-date literals and aggregation through search_opportunities/search_events/search_tasks rather than fetching broad datasets and manually filtering them in the model.
+- For a known deal that needs history, contacts, Events or Tasks, use get_opportunity_context.
 - Never invent CRM records or fields.
 - Account billing/shipping addresses are customer/site address information.
 - Contact mailing addresses are contact-level addresses.
 - Opportunity contacts are represented by Opportunity Contact Roles.
+- If the user asks to call a contact, resolve the correct Contact/primary Opportunity Contact Role so the mobile UI can show a callable phone action. Do not claim a phone call was placed; the user must tap the native Call action.
 - Salesforce Events represent meetings/appointments. WhoId is the person side
   (Contact in this pilot); WhatId is the related Account or Opportunity.
 - Resolve relative meeting dates/times from the supplied user device local time
@@ -2773,6 +3122,16 @@ def ui_block_from_tool_result(tool_name, result, call_id):
         return None
 
     if tool_name == "search_opportunities":
+        if result.get("summary_rows") is not None:
+            return {
+                "type": "opportunity_summary",
+                "title": "Opportunity summary",
+                "count": result.get("count", 0),
+                "items": result.get("summary_rows") or [],
+                "aggregate": result.get("aggregate"),
+                "group_by": result.get("group_by"),
+                "source_tool_call": call_id,
+            }
         return {
             "type": "opportunity_list",
             "title": "Opportunities",
@@ -2815,6 +3174,28 @@ def ui_block_from_tool_result(tool_name, result, call_id):
             "title": "Contacts",
             "count": result.get("count", 0),
             "items": result.get("contacts") or [],
+            "source_tool_call": call_id,
+        }
+
+    if tool_name == "search_tasks":
+        return {
+            "type": "task_list",
+            "title": "Salesforce Tasks",
+            "count": result.get("count", 0),
+            "items": result.get("tasks") or [],
+            "source_tool_call": call_id,
+        }
+
+    if tool_name == "get_opportunity_context":
+        return {
+            "type": "opportunity_context",
+            "title": "Opportunity context",
+            "count": 1,
+            "items": [{
+                "opportunity": result.get("opportunity"),
+                "events": result.get("events") or [],
+                "tasks": result.get("tasks") or [],
+            }],
             "source_tool_call": call_id,
         }
 
@@ -2878,6 +3259,30 @@ def build_conversation_text(display_text, ui_blocks, pending_actions):
             if rows:
                 parts.append("Structured Contacts shown on screen:\n" + "\n".join(rows))
 
+        elif block_type == "task_list":
+            rows = [
+                f"{i}. Task: {item.get('subject')} | Due: {item.get('activity_date')} | Status: {item.get('status')} | "
+                f"What: {(item.get('what') or {}).get('name')}"
+                for i, item in enumerate(items[:15], start=1)
+            ]
+            if rows:
+                parts.append("Structured Tasks shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "opportunity_summary":
+            rows = [f"{i}. Group: {item.get('group')} | {item.get('aggregate')}: {item.get('value')}" for i,item in enumerate(items[:20],start=1)]
+            if rows:
+                parts.append("Structured Opportunity aggregate shown on screen:\n" + "\n".join(rows))
+
+        elif block_type == "opportunity_context":
+            if items:
+                opp = (items[0] or {}).get("opportunity") or {}
+                parts.append(
+                    "Opportunity context shown on screen: "
+                    f"{opp.get('name')} | Stage {opp.get('stage')} | Amount {opp.get('amount')} | "
+                    f"Confidence {opp.get('confidence_level')} | Forecast {opp.get('add_to_forecast')} | "
+                    f"Primary product {opp.get('primary_product')} | Primary contact {(opp.get('primary_contact') or {}).get('name')}"
+                )
+
     if pending_actions:
         parts.append(
             "Pending Salesforce actions shown for confirmation: "
@@ -2910,6 +3315,36 @@ def create_confirmation_token(claims, salesforce_username, actions):
     )
 
 
+def emit_progress(callback, code, message, detail=None):
+    if callback:
+        try:
+            callback(code, message, detail or {})
+        except Exception:
+            pass
+
+
+def tool_progress_message(tool_name, arguments):
+    arguments = arguments or {}
+    if tool_name == "search_opportunities":
+        if arguments.get("overdue"):
+            return "Checking Salesforce for overdue opportunities…"
+        if arguments.get("close_date_relative"):
+            label = str(arguments.get("close_date_relative")).replace("_", " ").lower()
+            return f"Finding opportunities for {label}…"
+        if arguments.get("aggregate") and arguments.get("aggregate") != "none":
+            return "Calculating Salesforce pipeline summary…"
+        return "Querying Salesforce opportunities…"
+    if tool_name == "get_opportunity_context": return "Loading opportunity history, contacts and activities…"
+    if tool_name == "search_events": return "Checking Salesforce meetings and events…"
+    if tool_name == "search_tasks":
+        return "Checking overdue Salesforce tasks…" if arguments.get("overdue") else "Checking Salesforce tasks…"
+    if tool_name == "search_contacts": return "Looking up Salesforce contacts…"
+    if tool_name == "search_accounts": return "Looking up Salesforce accounts…"
+    if tool_name == "find_nearby_accounts": return "Finding nearby customers in Salesforce…"
+    if tool_name.startswith("propose_"): return "Preparing a Salesforce change for your review…"
+    return "Working with Salesforce…"
+
+
 def execute_agent(
     user_message,
     decision,
@@ -2919,6 +3354,8 @@ def execute_agent(
     history=None,
     client_context=None,
     location_context=None,
+    progress_callback=None,
+    request_id=None,
 ):
     history = history or []
     client_context = client_context or {}
@@ -2937,6 +3374,8 @@ def execute_agent(
                 + client_time_prompt(client_context)
                 + "\n\n"
                 + location_prompt(location_context)
+                + "\n\n"
+                + configurable_context_prompt()
                 + "\n\nRoute selected: "
                 + decision.route
                 + "\nWeb required: "
@@ -2961,6 +3400,7 @@ def execute_agent(
     for round_number in range(1, 10):
         current_tools = tools
         tool_choice = "auto"
+        forcing_web = force_web_next_round
 
         if force_web_next_round:
             current_tools = [{"type": "web_search"}]
@@ -2983,12 +3423,27 @@ def execute_agent(
         if decision.needs_web:
             kwargs["include"] = ["web_search_call.action.sources"]
 
+        if forcing_web or (decision.needs_web and not web_used and round_number > 1):
+            emit_progress(progress_callback, "web_search", "Searching the web…")
+        elif round_number == 1 and decision.needs_web and decision.needs_salesforce:
+            emit_progress(progress_callback, "agent_plan", "Planning Salesforce and web research…")
+        elif round_number == 1 and decision.needs_web:
+            emit_progress(progress_callback, "web_search", "Searching the web…")
+        elif round_number == 1 and decision.needs_salesforce:
+            emit_progress(progress_callback, "agent_plan", "Planning the Salesforce lookup…")
+        elif round_number > 1:
+            emit_progress(progress_callback, "synthesizing", "Analyzing the results…")
+
         response = openai_client.responses.create(**kwargs)
 
         web_meta = collect_web_metadata(response)
 
         if web_meta["used"]:
             web_used = True
+            emit_progress(progress_callback, "web_review", "Reviewing web research…")
+            audit_log("web_search", owner_oid=claims.get("oid"), salesforce_username=salesforce_username,
+                      request_id=request_id, summary="Web research performed",
+                      details={"search_count": len(web_meta.get("searches") or []), "source_count": len(web_meta.get("sources") or [])})
 
         web_search_trace.extend(web_meta["searches"])
 
@@ -3017,6 +3472,7 @@ def execute_agent(
                 force_web_next_round = True
                 continue
 
+            emit_progress(progress_callback, "finalizing", "Preparing Sally's answer…")
             raw_answer = (response.output_text or "").strip()
 
             if not raw_answer:
@@ -3080,12 +3536,13 @@ def execute_agent(
                         ),
                     }
                 else:
+                    emit_progress(progress_callback, "salesforce_tool", tool_progress_message(call.name, arguments), {"tool": call.name})
                     result = run_function_tool(
                         call.name,
                         arguments,
                         sf,
                         salesforce_username,
-                        runtime_context={"location_context": location_context},
+                        runtime_context={"location_context": location_context, "request_id": request_id},
                     )
 
             if result.get("pending_action"):
@@ -3103,6 +3560,12 @@ def execute_agent(
                 "result_count": result.get("count"),
                 "status": result.get("status"),
             })
+            audit_log(
+                "salesforce_tool" if call.name != "web_search" else "web_tool",
+                owner_oid=claims.get("oid"), salesforce_username=salesforce_username, request_id=request_id,
+                summary=f"{call.name}: {'ok' if result.get('ok') else 'failed'}",
+                details={"tool": call.name, "ok": result.get("ok", False), "count": result.get("count"), "status": result.get("status")},
+            )
 
             input_items.append({
                 "type": "function_call_output",
@@ -3459,7 +3922,7 @@ def diarize_audio_files(audio_parts):
                 chunking_strategy="auto",
             )
         payload = transcript.model_dump() if hasattr(transcript, "model_dump") else dict(transcript)
-        chunk_text = str(payload.get("text") or "").strip()
+        chunk_text = apply_jargon_normalization(str(payload.get("text") or "").strip())
         if chunk_text:
             combined_text.append(chunk_text)
         for seg_index, segment in enumerate(payload.get("segments") or []):
@@ -3473,7 +3936,7 @@ def diarize_audio_files(audio_parts):
                 "speaker": speaker,
                 "start": start,
                 "end": end,
-                "text": str(segment.get("text") or "").strip(),
+                "text": apply_jargon_normalization(str(segment.get("text") or "").strip()),
             })
             duration = max(duration, end)
 
@@ -3521,7 +3984,7 @@ Rules:
         reasoning={"effort": "medium"},
         store=False,
         input=[
-            {"role": "developer", "content": instructions},
+            {"role": "developer", "content": instructions + "\n\n" + configurable_context_prompt()},
             {
                 "role": "user",
                 "content": (
@@ -3613,6 +4076,7 @@ def process_session(session_id, owner_oid, salesforce_username):
                 ),
             )
             conn.commit()
+        audit_log("session_ready", owner_oid, salesforce_username, None, "Session processing completed", {"session_id": session_id, "linked_opportunity_id": linked_id})
 
     except Exception as exc:
         try:
@@ -3624,6 +4088,7 @@ def process_session(session_id, owner_oid, salesforce_username):
                 conn.commit()
         except Exception:
             pass
+        audit_log("session_error", owner_oid, salesforce_username, None, "Session processing failed", {"session_id": session_id, "error": str(exc)[:2000]})
 
 
 SESSION_PROCESSING_IDS = set()
@@ -3739,6 +4204,95 @@ def get_session_open_opportunity(sf, salesforce_username, opportunity_id):
 
 
 # ============================================================
+# SESSION SOFT DELETE / DEMO ARCHIVE
+# ============================================================
+
+def _session_row_any(session_id, owner_oid=None):
+    sid = safe_session_id(session_id)
+    with session_db() as conn:
+        if owner_oid is None:
+            row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM sessions WHERE session_id=? AND owner_oid=?", (sid, str(owner_oid))).fetchone()
+    return row
+
+
+def _remap_session_path(path_value, old_root, new_root):
+    if not path_value:
+        return None
+    try:
+        p = Path(path_value)
+        relative = p.relative_to(old_root)
+        return str(new_root / relative)
+    except Exception:
+        return path_value
+
+
+def archive_session(session_id, owner_oid, deleted_by):
+    row = _session_row_any(session_id, owner_oid)
+    if not row or row["deleted_at"]:
+        raise ValueError("Session not found.")
+    if row["status"] in {"uploaded", "transcribing", "analyzing"}:
+        raise ValueError("Wait for Session processing to finish before deleting it.")
+
+    safe_owner = re.sub(r"[^A-Za-z0-9_-]", "_", str(owner_oid))
+    source_root = Path(row["audio_path"]).parent if row["audio_path"] else (SESSION_AUDIO_ROOT / safe_owner / session_id)
+    archive_root = SESSION_DELETED_ROOT / safe_owner / session_id
+    if archive_root.exists():
+        archive_root = SESSION_DELETED_ROOT / safe_owner / f"{session_id}_{int(time.time())}"
+    archive_root.parent.mkdir(parents=True, exist_ok=True)
+
+    if source_root.exists():
+        shutil.move(str(source_root), str(archive_root))
+
+    now = utc_now_iso()
+    updated_paths = {
+        "audio_path": _remap_session_path(row["audio_path"], source_root, archive_root),
+        "transcript_json_path": _remap_session_path(row["transcript_json_path"], source_root, archive_root),
+        "transcript_text_path": _remap_session_path(row["transcript_text_path"], source_root, archive_root),
+        "summary_json_path": _remap_session_path(row["summary_json_path"], source_root, archive_root),
+    }
+    with session_db() as conn:
+        conn.execute(
+            """UPDATE sessions SET audio_path=?, transcript_json_path=?, transcript_text_path=?, summary_json_path=?,
+               deleted_at=?, deleted_by=?, deleted_archive_path=?, updated_at=? WHERE session_id=? AND owner_oid=?""",
+            (updated_paths["audio_path"], updated_paths["transcript_json_path"], updated_paths["transcript_text_path"],
+             updated_paths["summary_json_path"], now, str(deleted_by or owner_oid), str(archive_root), now, session_id, str(owner_oid)),
+        )
+        conn.commit()
+    audit_log("session_deleted", owner_oid, row["salesforce_username"], None, "Session moved to demo deleted archive", {"session_id": session_id})
+    return True
+
+
+def restore_archived_session(session_id):
+    row = _session_row_any(session_id)
+    if not row or not row["deleted_at"]:
+        raise ValueError("Deleted Session not found.")
+    owner_oid = row["owner_oid"]
+    safe_owner = re.sub(r"[^A-Za-z0-9_-]", "_", str(owner_oid))
+    archive_root = Path(row["deleted_archive_path"] or "")
+    active_root = SESSION_AUDIO_ROOT / safe_owner / session_id
+    if active_root.exists():
+        raise ValueError("An active Session directory with this id already exists.")
+    active_root.parent.mkdir(parents=True, exist_ok=True)
+    if archive_root.exists():
+        shutil.move(str(archive_root), str(active_root))
+    now = utc_now_iso()
+    with session_db() as conn:
+        conn.execute(
+            """UPDATE sessions SET audio_path=?, transcript_json_path=?, transcript_text_path=?, summary_json_path=?,
+               deleted_at=NULL, deleted_by=NULL, deleted_archive_path=NULL, updated_at=? WHERE session_id=?""",
+            (_remap_session_path(row["audio_path"], archive_root, active_root),
+             _remap_session_path(row["transcript_json_path"], archive_root, active_root),
+             _remap_session_path(row["transcript_text_path"], archive_root, active_root),
+             _remap_session_path(row["summary_json_path"], archive_root, active_root), now, session_id),
+        )
+        conn.commit()
+    audit_log("session_restored", owner_oid, row["salesforce_username"], None, "Deleted Session restored by admin", {"session_id": session_id})
+    return True
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 
@@ -3747,7 +4301,7 @@ def root():
     return jsonify({
         "service": "CMD Sally API",
         "status": "running",
-        "version": "cmd-sally-v3",
+        "version": "cmd-sally-v4-demo",
     })
 
 
@@ -3755,10 +4309,10 @@ def root():
 def health():
     return jsonify({
         "ok": True,
-        "version": "cmd-sally-v3",
+        "version": "cmd-sally-v4-demo",
         "session_storage_root": str(SESSION_STORAGE_ROOT),
         "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
-        "demo_geo_enabled": DEMO_GEO_ENABLED,
+        "demo_geo_enabled": feature_enabled("demo_geography", DEMO_GEO_ENABLED),
     })
 
 
@@ -3776,6 +4330,16 @@ def me():
         "scope": claims.get("scp"),
         "audience": claims.get("aud"),
         "token_version": claims.get("ver"),
+    })
+
+
+@app.get("/capabilities")
+@require_auth
+def capabilities():
+    """Return current demo capabilities and client speech hints to the mobile app."""
+    return jsonify({
+        "capabilities": current_capabilities(),
+        "speech_context": client_speech_context(),
     })
 
 
@@ -3855,125 +4419,226 @@ def salesforce_me():
     })
 
 
-@app.post("/chat")
-@require_auth
-def chat():
-    body = request.get_json(silent=True) or {}
+# ============================================================
+# CHAT EXECUTION + LIVE STATUS JOBS
+# ============================================================
+
+CHAT_JOBS = {}
+CHAT_JOBS_LOCK = threading.Lock()
+CHAT_JOB_SEMAPHORE = threading.BoundedSemaphore(CHAT_JOB_MAX_CONCURRENT)
+
+
+def _cleanup_chat_jobs():
+    cutoff = time.time() - CHAT_JOB_TTL_SECONDS
+    with CHAT_JOBS_LOCK:
+        stale = [job_id for job_id, job in CHAT_JOBS.items() if job.get("updated_ts", 0) < cutoff and job.get("state") in {"completed", "failed"}]
+        for job_id in stale:
+            CHAT_JOBS.pop(job_id, None)
+
+
+def _job_public(job, include_result=False):
+    payload = {
+        "job_id": job["job_id"],
+        "state": job["state"],
+        "current_status": job.get("current_status"),
+        "status_code": job.get("status_code"),
+        "events": job.get("events", [])[-20:],
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+    if job.get("error"):
+        payload["error"] = job["error"]
+    if include_result and job.get("state") == "completed":
+        payload["result"] = job.get("result")
+    return payload
+
+
+def set_chat_job_status(job_id, code, message, detail=None):
+    now_iso = utc_now_iso()
+    with CHAT_JOBS_LOCK:
+        job = CHAT_JOBS.get(job_id)
+        if not job:
+            return
+        job["status_code"] = code
+        job["current_status"] = message
+        job["updated_at"] = now_iso
+        job["updated_ts"] = time.time()
+        event = {"code": code, "message": message, "at": now_iso}
+        if detail:
+            event["detail"] = detail
+        events = job.setdefault("events", [])
+        if not events or events[-1].get("code") != code or events[-1].get("message") != message:
+            events.append(event)
+            del events[:-30]
+
+
+def run_chat_logic(body, claims, progress_callback=None, request_id=None):
     user_message = (body.get("message") or "").strip()
     history = normalize_conversation_history(body.get("history"))
     client_context = normalize_client_context(body.get("client_context"))
-
     if not user_message:
-        return jsonify({"error": "message_required"}), 400
+        raise ValueError("message_required")
 
-    claims = request.user_claims
     salesforce_username = claims.get("preferred_username")
-
     if not salesforce_username:
-        return jsonify({
-            "error": "preferred_username_missing"
-        }), 400
+        raise ValueError("preferred_username_missing")
 
-    try:
-        # Stage 1: cheap Luna router, with recent conversation context.
-        decision = route_or_answer(
-            user_message,
-            history=history,
-            client_context=client_context,
-        )
-        route_data = decision.model_dump()
+    emit_progress(progress_callback, "routing", "Understanding your request…")
+    decision = route_or_answer(user_message, history=history, client_context=client_context)
+    route_data = decision.model_dump()
 
-        # Simple answer already completed by router.
-        if decision.action == "answer":
-            return jsonify({
-                "status": "answered",
-                "user": salesforce_username,
-                "router_model": "gpt-5.6-luna",
-                "route": route_data,
-                "execution_model": "gpt-5.6-luna",
-                "answer": decision.answer,
-                "display_text": decision.answer,
-                "speech_text": decision.answer,
-                "conversation_text": decision.answer,
-                "ui_blocks": [],
-                "capabilities": CAPABILITY_MANIFEST,
-                "tool_trace": [],
-                "web_used": False,
-                "web_sources": [],
-                "pending_actions": [],
-                "confirmation_required": False,
-                "conversation_history_used": len(history),
-            })
+    if decision.needs_salesforce and not feature_enabled("salesforce_reads", True):
+        raise RuntimeError("Salesforce reads are temporarily disabled by the demo administrator.")
+    if decision.needs_write and not feature_enabled("salesforce_writes", True):
+        raise RuntimeError("Salesforce writes are temporarily disabled by the demo administrator.")
+    if decision.needs_web and not feature_enabled("web_research", True):
+        raise RuntimeError("Web research is temporarily disabled by the demo administrator.")
+    if decision.route in {"web_research", "deep_complex"} and not feature_enabled("long_research", True):
+        raise RuntimeError("Long research jobs are temporarily disabled by the demo administrator.")
 
-        sf = None
-
-        if decision.needs_salesforce:
-            sf = get_salesforce_access_token(
-                salesforce_username
-            )
-
-        location_context = None
-        if sf is not None and client_context.get("location"):
-            location_context = resolve_location_context(
-                sf, salesforce_username, client_context, claims
-            )
-
-        result = execute_agent(
-            user_message,
-            decision,
-            sf,
-            salesforce_username,
-            claims,
-            history=history,
-            client_context=client_context,
-            location_context=location_context,
-        )
-
-        response_body = {
-            "status": (
-                "confirmation_required"
-                if result["confirmation_required"]
-                else "answered"
-            ),
-            "user": salesforce_username,
-            "router_model": "gpt-5.6-luna",
-            "route": route_data,
-            "execution_model": result["execution_model"],
-            "execution_effort": result["reasoning_effort"],
-            "tool_rounds": result["tool_rounds"],
-            "tool_trace": result["tool_trace"],
-            "web_used": result["web_used"],
-            "web_search_trace": result["web_search_trace"],
-            "web_sources": result["web_sources"],
-            "pending_actions": result["pending_actions"],
-            "confirmation_required": result["confirmation_required"],
-            "answer": result["answer"],
-            "display_text": result["display_text"],
-            "speech_text": result["speech_text"],
-            "conversation_text": result["conversation_text"],
-            "ui_blocks": result["ui_blocks"],
-            "capabilities": CAPABILITY_MANIFEST,
-            "location_context": result.get("location_context"),
+    if decision.action == "answer":
+        emit_progress(progress_callback, "finalizing", "Preparing Sally's answer…")
+        return {
+            "status": "answered", "user": salesforce_username, "router_model": "gpt-5.6-luna",
+            "route": route_data, "execution_model": "gpt-5.6-luna", "answer": decision.answer,
+            "display_text": decision.answer, "speech_text": decision.answer, "conversation_text": decision.answer,
+            "ui_blocks": [], "capabilities": current_capabilities(), "tool_trace": [], "web_used": False,
+            "web_sources": [], "pending_actions": [], "confirmation_required": False,
             "conversation_history_used": len(history),
         }
 
-        if result["confirmation_token"]:
-            response_body["confirmation_token"] = (
-                result["confirmation_token"]
+    sf = None
+    if decision.needs_salesforce:
+        emit_progress(progress_callback, "salesforce_auth", "Connecting to Salesforce…")
+        sf = get_salesforce_access_token(salesforce_username)
+
+    location_context = None
+    if sf is not None and client_context.get("location") and feature_enabled("location", True):
+        emit_progress(progress_callback, "location", "Resolving your CRM location…")
+        location_context = resolve_location_context(sf, salesforce_username, client_context, claims)
+
+    result = execute_agent(
+        user_message, decision, sf, salesforce_username, claims,
+        history=history, client_context=client_context, location_context=location_context,
+        progress_callback=progress_callback, request_id=request_id,
+    )
+    response_body = {
+        "status": "confirmation_required" if result["confirmation_required"] else "answered",
+        "user": salesforce_username, "router_model": "gpt-5.6-luna", "route": route_data,
+        "execution_model": result["execution_model"], "execution_effort": result["reasoning_effort"],
+        "tool_rounds": result["tool_rounds"], "tool_trace": result["tool_trace"],
+        "web_used": result["web_used"], "web_search_trace": result["web_search_trace"],
+        "web_sources": result["web_sources"], "pending_actions": result["pending_actions"],
+        "confirmation_required": result["confirmation_required"], "answer": result["answer"],
+        "display_text": result["display_text"], "speech_text": result["speech_text"],
+        "conversation_text": result["conversation_text"], "ui_blocks": result["ui_blocks"],
+        "capabilities": current_capabilities(), "location_context": result.get("location_context"),
+        "conversation_history_used": len(history),
+    }
+    if result["confirmation_token"]:
+        response_body["confirmation_token"] = result["confirmation_token"]
+    return response_body
+
+
+def _chat_job_worker(job_id, body, claims):
+    owner_oid = claims.get("oid")
+    username = claims.get("preferred_username")
+    try:
+        set_chat_job_status(job_id, "queued", "Waiting for Sally's worker…")
+        with CHAT_JOB_SEMAPHORE:
+            set_chat_job_status(job_id, "started", "Sally is starting…")
+            result = run_chat_logic(
+                body, claims,
+                progress_callback=lambda code, message, detail=None: set_chat_job_status(job_id, code, message, detail),
+                request_id=job_id,
             )
+            with CHAT_JOBS_LOCK:
+                job = CHAT_JOBS.get(job_id)
+                if job:
+                    job["state"] = "completed"
+                    job["result"] = result
+                    job["current_status"] = None
+                    job["status_code"] = "completed"
+                    job["updated_at"] = utc_now_iso()
+                    job["updated_ts"] = time.time()
+            audit_log("chat_completed", owner_oid, username, job_id, "Chat request completed", {
+                "route": (result.get("route") or {}).get("route"),
+                "execution_model": result.get("execution_model"),
+                "tool_count": len(result.get("tool_trace") or []),
+                "web_used": bool(result.get("web_used")),
+            })
+    except Exception as exc:
+        with CHAT_JOBS_LOCK:
+            job = CHAT_JOBS.get(job_id)
+            if job:
+                job["state"] = "failed"
+                job["error"] = {"code": "chat_failed", "message": str(exc)[:1200]}
+                job["current_status"] = None
+                job["status_code"] = "failed"
+                job["updated_at"] = utc_now_iso()
+                job["updated_ts"] = time.time()
+        audit_log("chat_failed", owner_oid, username, job_id, "Chat request failed", {"error": str(exc)[:2000]})
 
-        return jsonify(response_body)
 
-    except Exception as e:
-        return jsonify({
-            "error": "chat_failed",
-            "details": str(e),
-        }), 500
+@app.post("/chat/start")
+@require_auth
+def chat_start():
+    _cleanup_chat_jobs()
+    body = request.get_json(silent=True) or {}
+    if not (body.get("message") or "").strip():
+        return jsonify({"error": "message_required"}), 400
+    claims = dict(request.user_claims)
+    owner_oid = claims.get("oid")
+    if not owner_oid:
+        return jsonify({"error": "oid_missing"}), 400
+    with CHAT_JOBS_LOCK:
+        active = sum(1 for j in CHAT_JOBS.values() if j.get("owner_oid") == owner_oid and j.get("state") in {"queued", "running"})
+        if active >= 3:
+            return jsonify({"error": "too_many_active_requests", "details": "Wait for one of Sally's active requests to finish."}), 429
+        job_id = "req_" + uuid.uuid4().hex[:20]
+        now = utc_now_iso()
+        CHAT_JOBS[job_id] = {
+            "job_id": job_id, "owner_oid": owner_oid, "salesforce_username": claims.get("preferred_username"),
+            "state": "running", "status_code": "accepted", "current_status": "Sending to Sally…",
+            "events": [{"code": "accepted", "message": "Sending to Sally…", "at": now}],
+            "result": None, "error": None, "created_at": now, "updated_at": now, "updated_ts": time.time(),
+        }
+    audit_log("chat_started", owner_oid, claims.get("preferred_username"), job_id, "Chat request started", {})
+    threading.Thread(target=_chat_job_worker, args=(job_id, body, claims), daemon=True, name=f"chat-{job_id}").start()
+    with CHAT_JOBS_LOCK:
+        return jsonify(_job_public(CHAT_JOBS[job_id])), 202
+
+
+@app.get("/chat/jobs/<job_id>")
+@require_auth
+def chat_job_status(job_id):
+    _cleanup_chat_jobs()
+    with CHAT_JOBS_LOCK:
+        job = CHAT_JOBS.get(job_id)
+        if not job or job.get("owner_oid") != request.user_claims.get("oid"):
+            return jsonify({"error": "job_not_found"}), 404
+        return jsonify(_job_public(job, include_result=True))
+
+
+@app.post("/chat")
+@require_auth
+def chat():
+    """Backward-compatible synchronous endpoint. V4 mobile uses /chat/start."""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(run_chat_logic(body, request.user_claims))
+    except ValueError as exc:
+        code = str(exc)
+        return jsonify({"error": code}), 400
+    except Exception as exc:
+        return jsonify({"error": "chat_failed", "details": str(exc)}), 500
 
 
 @app.post("/location/resolve")
 @require_auth
 def resolve_device_location():
+    if not feature_enabled("location", True):
+        return jsonify({"error": "location_disabled"}), 403
     body = request.get_json(silent=True) or {}
     client_context = normalize_client_context(body.get("client_context") or body)
     if not client_context.get("location"):
@@ -4000,7 +4665,7 @@ def list_sessions():
     owner_oid = request.user_claims.get("oid")
     with session_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM sessions WHERE owner_oid=? ORDER BY created_at DESC LIMIT 100",
+            "SELECT * FROM sessions WHERE owner_oid=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100",
             (owner_oid,),
         ).fetchall()
     return jsonify({
@@ -4013,6 +4678,8 @@ def list_sessions():
 @app.post("/sessions/upload")
 @require_auth
 def upload_session():
+    if not feature_enabled("session_recording", True):
+        return jsonify({"error": "session_recording_disabled"}), 403
     claims = request.user_claims
     owner_oid = claims.get("oid")
     salesforce_username = claims.get("preferred_username")
@@ -4062,6 +4729,21 @@ def upload_session():
         }), 202
     except Exception as exc:
         return jsonify({"error": "session_upload_failed", "details": str(exc)}), 400
+
+
+@app.delete("/sessions/<session_id>")
+@require_auth
+def delete_session(session_id):
+    if not feature_enabled("session_soft_delete", True):
+        return jsonify({"error": "session_delete_disabled"}), 403
+    claims = request.user_claims
+    try:
+        archive_session(session_id, claims.get("oid"), claims.get("preferred_username") or claims.get("oid"))
+        return jsonify({"status": "deleted", "session_id": session_id})
+    except ValueError as exc:
+        return jsonify({"error": "session_delete_failed", "details": str(exc)}), 409
+    except Exception as exc:
+        return jsonify({"error": "session_delete_failed", "details": str(exc)}), 400
 
 
 @app.get("/sessions/<session_id>")
@@ -4161,6 +4843,8 @@ def link_session_opportunity(session_id):
 @app.post("/confirm")
 @require_auth
 def confirm():
+    if not feature_enabled("salesforce_writes", True):
+        return jsonify({"error": "salesforce_writes_disabled"}), 403
     body = request.get_json(silent=True) or {}
     confirmation_token = body.get("confirmation_token")
 
@@ -4178,6 +4862,20 @@ def confirm():
             request.user_claims,
             payload,
         )
+        for item in results:
+            audit_log(
+                "salesforce_write",
+                owner_oid=request.user_claims.get("oid"),
+                salesforce_username=request.user_claims.get("preferred_username"),
+                summary=f"{item.get('action') or 'salesforce_write'} confirmed",
+                details={
+                    "action": item.get("action"),
+                    "field_name": item.get("field_name"),
+                    "status": item.get("status"),
+                    "opportunity_id": item.get("opportunity_id"),
+                    "event_id": item.get("event_id"),
+                },
+            )
 
         return jsonify({
             "status": "confirmed",
@@ -4200,6 +4898,360 @@ def confirm():
             "error": "confirmation_failed",
             "details": str(e),
         }), 400
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        if request.path.startswith("/admin") and not request.path.startswith("/admin/api"):
+            return error
+        return jsonify({"error": error.name.lower().replace(" ", "_"), "details": error.description}), error.code
+    audit_log("unhandled_error", summary="Unhandled backend exception", details={"path": request.path, "error": str(error)[:2000]})
+    return jsonify({"error": "internal_error", "details": "CMD Sally could not complete this request."}), 500
+
+
+# ============================================================
+# DEMO ADMIN CONSOLE
+# ============================================================
+
+ADMIN_LOGIN_ATTEMPTS = {}
+ADMIN_LOGIN_LOCK = threading.Lock()
+
+
+def admin_configured():
+    return bool(ADMIN_USERNAME and ADMIN_PASSWORD and ADMIN_SESSION_SECRET)
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not admin_configured():
+            return "CMD Sally Admin is not configured. Set ADMIN_USERNAME, ADMIN_PASSWORD and ADMIN_SESSION_SECRET in Render.", 503
+        if not session.get("cmd_sally_admin"):
+            return redirect(url_for("admin_login", next=request.path))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def admin_api_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not admin_configured():
+            return jsonify({"error": "admin_not_configured"}), 503
+        if not session.get("cmd_sally_admin"):
+            return jsonify({"error": "admin_auth_required"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def admin_mutation_required(fn):
+    @wraps(fn)
+    @admin_api_required
+    def wrapper(*args, **kwargs):
+        expected = session.get("admin_csrf") or ""
+        provided = request.headers.get("X-CSRF-Token", "")
+        if not expected or not hmac.compare_digest(expected, provided):
+            return jsonify({"error": "csrf_failed"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _admin_login_allowed(ip):
+    now = time.time()
+    with ADMIN_LOGIN_LOCK:
+        recent = [t for t in ADMIN_LOGIN_ATTEMPTS.get(ip, []) if now - t < 600]
+        ADMIN_LOGIN_ATTEMPTS[ip] = recent
+        return len(recent) < 6
+
+
+def _admin_record_login_failure(ip):
+    with ADMIN_LOGIN_LOCK:
+        ADMIN_LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+def _row_to_workflow(row):
+    d = dict(row)
+    d["triggers"] = json.loads(d.pop("triggers_json") or "[]")
+    d["steps"] = json.loads(d.pop("steps_json") or "[]")
+    d["tools"] = json.loads(d.pop("tools_json") or "[]")
+    d["enabled"] = bool(d["enabled"])
+    d["confirmation_required"] = bool(d["confirmation_required"])
+    return d
+
+
+def _row_to_jargon(row):
+    d = dict(row)
+    d["aliases"] = json.loads(d.pop("aliases_json") or "[]")
+    d["enabled"] = bool(d["enabled"])
+    return d
+
+
+@app.get("/admin/login")
+def admin_login():
+    if session.get("cmd_sally_admin"):
+        return redirect(url_for("admin_home"))
+    return render_template("admin_login.html", configured=admin_configured(), error=None)
+
+
+@app.post("/admin/login")
+def admin_login_post():
+    if not admin_configured():
+        return render_template("admin_login.html", configured=False, error="Admin environment variables are not configured."), 503
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not _admin_login_allowed(ip):
+        return render_template("admin_login.html", configured=True, error="Too many failed attempts. Try again later."), 429
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    valid = hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    if not valid:
+        _admin_record_login_failure(ip)
+        audit_log("admin_login_failed", summary="Admin login failed", details={"ip": ip})
+        return render_template("admin_login.html", configured=True, error="Invalid username or password."), 401
+    session.clear()
+    session["cmd_sally_admin"] = True
+    session["admin_username"] = username
+    session["admin_csrf"] = secrets.token_urlsafe(32)
+    audit_log("admin_login", summary="Admin login successful", details={"ip": ip})
+    return redirect(url_for("admin_home"))
+
+
+@app.post("/admin/logout")
+@admin_required
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
+@app.get("/admin")
+@admin_required
+def admin_home():
+    return render_template("admin.html", csrf_token=session.get("admin_csrf"), admin_username=session.get("admin_username"))
+
+
+@app.get("/admin/api/overview")
+@admin_api_required
+def admin_overview():
+    today = datetime.now(timezone.utc).date().isoformat()
+    with session_db() as conn:
+        session_counts = dict(conn.execute("""SELECT
+            SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) active,
+            SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) deleted,
+            SUM(CASE WHEN deleted_at IS NULL AND status='error' THEN 1 ELSE 0 END) errors
+            FROM sessions""").fetchone())
+        audit_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        requests_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type='chat_started' AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        tool_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type='salesforce_tool' AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        writes_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type='salesforce_write' AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        web_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type='web_search' AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        sessions_ready_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type='session_ready' AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        errors_today = conn.execute("SELECT COUNT(*) c FROM audit_events WHERE event_type IN ('chat_failed','session_error') AND created_at LIKE ?", (today + "%",)).fetchone()["c"]
+        users = conn.execute("""SELECT salesforce_username, owner_oid, MAX(created_at) last_seen, COUNT(*) activity_count
+            FROM audit_events WHERE salesforce_username IS NOT NULL GROUP BY salesforce_username, owner_oid ORDER BY last_seen DESC LIMIT 50""").fetchall()
+        event_counts = conn.execute("SELECT event_type, COUNT(*) c FROM audit_events WHERE created_at LIKE ? GROUP BY event_type ORDER BY c DESC", (today + "%",)).fetchall()
+    with CHAT_JOBS_LOCK:
+        jobs = [_job_public(j, include_result=False) | {"salesforce_username": j.get("salesforce_username")} for j in CHAT_JOBS.values()]
+    jobs.sort(key=lambda j: j.get("updated_at") or "", reverse=True)
+    return jsonify({
+        "version": "cmd-sally-v4-demo", "service": "CMD Sally API", "storage_root": str(SESSION_STORAGE_ROOT),
+        "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
+        "feature_flags": get_feature_flags(), "forced_demo_cluster": get_config_setting("demo_geo_force_cluster", "automatic"),
+        "sessions": session_counts, "audit_events_today": audit_today, "requests_today": requests_today,
+        "salesforce_tool_calls_today": tool_today, "salesforce_writes_today": writes_today,
+        "web_searches_today": web_today, "sessions_ready_today": sessions_ready_today, "errors_today": errors_today,
+        "users": [dict(r) for r in users], "event_counts": [dict(r) for r in event_counts], "jobs": jobs[:25],
+        "models": {"orchestrator": "gpt-5.6-luna / low", "analysis": "gpt-5.6-terra", "deep": "gpt-5.6-sol", "transcription": "gpt-4o-transcribe-diarize"},
+        "voicepuck": {"mode": "demo", "assigned": False, "connected": False},
+    })
+
+
+@app.get("/admin/api/audit")
+@admin_api_required
+def admin_audit():
+    limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    with session_db() as conn:
+        rows = conn.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    items=[]
+    for row in rows:
+        d=dict(row)
+        d["details"] = json.loads(d.pop("details_json") or "{}")
+        items.append(d)
+    return jsonify({"events": items})
+
+
+@app.get("/admin/api/sessions")
+@admin_api_required
+def admin_sessions():
+    deleted = request.args.get("deleted", "false").lower() == "true"
+    where = "deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL"
+    with session_db() as conn:
+        rows = conn.execute(f"SELECT * FROM sessions WHERE {where} ORDER BY updated_at DESC LIMIT 200").fetchall()
+    return jsonify({"sessions": [session_row_to_dict(row, include_summary=False) | {"owner_oid": row["owner_oid"], "salesforce_username": row["salesforce_username"], "deleted_archive_path": row["deleted_archive_path"]} for row in rows]})
+
+
+@app.post("/admin/api/sessions/<session_id>/restore")
+@admin_mutation_required
+def admin_restore_session(session_id):
+    try:
+        restore_archived_session(session_id)
+        return jsonify({"status": "restored", "session_id": session_id})
+    except Exception as exc:
+        return jsonify({"error": "restore_failed", "details": str(exc)}), 400
+
+
+@app.post("/admin/api/sessions/<session_id>/retry")
+@admin_mutation_required
+def admin_retry_session(session_id):
+    row = _session_row_any(session_id)
+    if not row or row["deleted_at"]:
+        return jsonify({"error": "session_not_found"}), 404
+    if row["status"] in {"transcribing", "analyzing"}:
+        return jsonify({"error": "session_already_processing"}), 409
+    try:
+        launch_session_processing(row["session_id"], row["owner_oid"], row["salesforce_username"])
+        audit_log("admin_session_retry", row["owner_oid"], row["salesforce_username"], None,
+                  "Admin retried Session processing", {"session_id": row["session_id"]})
+        return jsonify({"status": "processing_restarted", "session_id": row["session_id"]}), 202
+    except Exception as exc:
+        return jsonify({"error": "session_retry_failed", "details": str(exc)}), 400
+
+
+@app.get("/admin/sessions/<session_id>/audio")
+@admin_required
+def admin_session_audio(session_id):
+    row = _session_row_any(session_id)
+    if not row or not row["audio_path"] or not Path(row["audio_path"]).exists(): abort(404)
+    return send_file(row["audio_path"], mimetype="audio/mp4", conditional=True)
+
+
+@app.get("/admin/sessions/<session_id>/transcript")
+@admin_required
+def admin_session_transcript(session_id):
+    row = _session_row_any(session_id)
+    if not row or not row["transcript_text_path"] or not Path(row["transcript_text_path"]).exists(): abort(404)
+    return send_file(row["transcript_text_path"], mimetype="text/plain")
+
+
+@app.get("/admin/api/feature-flags")
+@admin_api_required
+def admin_feature_flags():
+    return jsonify({"flags": get_feature_flags(), "forced_demo_cluster": get_config_setting("demo_geo_force_cluster", "automatic")})
+
+
+@app.post("/admin/api/feature-flags")
+@admin_mutation_required
+def admin_update_feature_flags():
+    body = request.get_json(silent=True) or {}
+    allowed = {"salesforce_reads", "salesforce_writes", "web_research", "session_recording", "session_soft_delete", "location", "demo_geography", "long_research", "voice_chat"}
+    with session_db() as conn:
+        for key, value in (body.get("flags") or {}).items():
+            if key in allowed and isinstance(value, bool):
+                conn.execute("INSERT INTO config_feature_flags(key,enabled,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at", (key, int(value), utc_now_iso()))
+        conn.commit()
+    cluster = body.get("forced_demo_cluster")
+    if cluster in {"automatic", "dallas", "houston", "austin", "chicago", "boston", "sf", "sandiego", "losangeles"}:
+        set_config_setting("demo_geo_force_cluster", cluster)
+    audit_log("admin_config", summary="Admin updated demo feature flags", details={"flags": body.get("flags"), "forced_demo_cluster": cluster})
+    return jsonify({"flags": get_feature_flags(), "forced_demo_cluster": get_config_setting("demo_geo_force_cluster", "automatic")})
+
+
+@app.get("/admin/api/workflows")
+@admin_api_required
+def admin_workflows():
+    with session_db() as conn:
+        rows=conn.execute("SELECT * FROM config_workflows ORDER BY name").fetchall()
+    return jsonify({"workflows": [_row_to_workflow(r) for r in rows]})
+
+
+@app.post("/admin/api/workflows")
+@admin_mutation_required
+def admin_save_workflow():
+    body=request.get_json(silent=True) or {}
+    name=str(body.get("name") or "").strip()
+    if not name: return jsonify({"error":"name_required"}),400
+    raw_wid = str(body.get("id") or "").strip()
+    if raw_wid and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw_wid):
+        return jsonify({"error":"invalid_workflow_id"}),400
+    wid=(raw_wid or re.sub(r"[^a-z0-9]+","_",name.lower()).strip("_") or ("wf_"+uuid.uuid4().hex[:8]))[:80]
+    desc=str(body.get("description") or "").strip()[:2000]
+    triggers=[str(x).strip()[:300] for x in (body.get("triggers") or []) if str(x).strip()][:30]
+    steps=[str(x).strip()[:500] for x in (body.get("steps") or []) if str(x).strip()][:30]
+    tools=[str(x).strip()[:100] for x in (body.get("tools") or []) if str(x).strip()][:20]
+    enabled=bool(body.get("enabled",True)); confirm=bool(body.get("confirmation_required",False)); now=utc_now_iso()
+    with session_db() as conn:
+        existing=conn.execute("SELECT version FROM config_workflows WHERE id=?",(wid,)).fetchone()
+        version=(existing["version"]+1) if existing else 1
+        conn.execute("""INSERT INTO config_workflows(id,name,description,triggers_json,steps_json,tools_json,confirmation_required,enabled,version,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,triggers_json=excluded.triggers_json,steps_json=excluded.steps_json,tools_json=excluded.tools_json,confirmation_required=excluded.confirmation_required,enabled=excluded.enabled,version=excluded.version,updated_at=excluded.updated_at""",
+            (wid,name,desc,json.dumps(triggers),json.dumps(steps),json.dumps(tools),int(confirm),int(enabled),version,now,now))
+        conn.commit()
+    audit_log("admin_workflow", summary=f"Workflow saved: {name}", details={"id":wid,"version":version,"enabled":enabled})
+    return jsonify({"status":"saved","id":wid,"version":version})
+
+
+@app.get("/admin/api/jargon")
+@admin_api_required
+def admin_jargon():
+    with session_db() as conn: rows=conn.execute("SELECT * FROM config_jargon ORDER BY term").fetchall()
+    return jsonify({"jargon": [_row_to_jargon(r) for r in rows]})
+
+
+@app.post("/admin/api/jargon")
+@admin_mutation_required
+def admin_save_jargon():
+    body=request.get_json(silent=True) or {}; term=str(body.get("term") or "").strip()
+    if not term: return jsonify({"error":"term_required"}),400
+    raw_jid = str(body.get("id") or "").strip()
+    if raw_jid and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw_jid):
+        return jsonify({"error":"invalid_jargon_id"}),400
+    jid=(raw_jid or re.sub(r"[^a-z0-9]+","_",term.lower()).strip("_") or ("j_"+uuid.uuid4().hex[:8]))[:80]
+    aliases=[str(x).strip()[:200] for x in (body.get("aliases") or []) if str(x).strip()][:50]
+    now=utc_now_iso()
+    values=(jid,term,json.dumps(aliases),str(body.get("pronunciation") or "")[:200],str(body.get("category") or "")[:100],str(body.get("definition") or "")[:3000],str(body.get("examples") or "")[:3000],str(body.get("stt_priority") or "normal")[:30],int(bool(body.get("enabled",True))),now,now)
+    with session_db() as conn:
+        conn.execute("""INSERT INTO config_jargon(id,term,aliases_json,pronunciation,category,definition,examples,stt_priority,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET term=excluded.term,aliases_json=excluded.aliases_json,pronunciation=excluded.pronunciation,category=excluded.category,definition=excluded.definition,examples=excluded.examples,stt_priority=excluded.stt_priority,enabled=excluded.enabled,updated_at=excluded.updated_at""",values); conn.commit()
+    audit_log("admin_jargon", summary=f"Jargon saved: {term}", details={"id":jid})
+    return jsonify({"status":"saved","id":jid})
+
+
+@app.get("/admin/api/knowledge")
+@admin_api_required
+def admin_knowledge():
+    with session_db() as conn: rows=conn.execute("SELECT * FROM config_knowledge ORDER BY category,title").fetchall()
+    return jsonify({"knowledge":[dict(r)|{"enabled":bool(r["enabled"])} for r in rows]})
+
+
+@app.post("/admin/api/knowledge")
+@admin_mutation_required
+def admin_save_knowledge():
+    body=request.get_json(silent=True) or {}; title=str(body.get("title") or "").strip(); content=str(body.get("content") or "").strip()
+    if not title or not content: return jsonify({"error":"title_and_content_required"}),400
+    raw_kid = str(body.get("id") or "").strip()
+    if raw_kid and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw_kid):
+        return jsonify({"error":"invalid_knowledge_id"}),400
+    kid=(raw_kid or re.sub(r"[^a-z0-9]+","_",title.lower()).strip("_") or ("k_"+uuid.uuid4().hex[:8]))[:80]; now=utc_now_iso()
+    with session_db() as conn:
+        conn.execute("""INSERT INTO config_knowledge(id,title,category,content,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title,category=excluded.category,content=excluded.content,enabled=excluded.enabled,updated_at=excluded.updated_at""",
+            (kid,title,str(body.get("category") or "")[:100],content[:12000],int(bool(body.get("enabled",True))),now,now)); conn.commit()
+    audit_log("admin_knowledge", summary=f"Knowledge saved: {title}", details={"id":kid})
+    return jsonify({"status":"saved","id":kid})
+
+
+@app.post("/admin/api/salesforce-test")
+@admin_mutation_required
+def admin_salesforce_test():
+    with session_db() as conn:
+        row=conn.execute("SELECT salesforce_username FROM sessions WHERE salesforce_username IS NOT NULL ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if not row: row=conn.execute("SELECT salesforce_username FROM audit_events WHERE salesforce_username IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    if not row: return jsonify({"error":"no_known_salesforce_user"}),400
+    username=row["salesforce_username"]
+    try:
+        sf=get_salesforce_access_token(username)
+        data=salesforce_query(sf["access_token"],sf["instance_url"],f"SELECT Id,Name,Username FROM User WHERE Username='{soql_escape(username)}' LIMIT 1")
+        return jsonify({"ok":True,"username":username,"instance_url":sf["instance_url"],"records":len(data.get("records",[])),"api_version":SF_API_VERSION})
+    except Exception as exc:
+        return jsonify({"ok":False,"error":str(exc)}),400
 
 
 # ============================================================
