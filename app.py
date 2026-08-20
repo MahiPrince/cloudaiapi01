@@ -35,6 +35,7 @@ import imageio_ffmpeg
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+APP_VERSION = "cmd-sally-v4.1-demo"
 
 
 # ============================================================
@@ -59,7 +60,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 # Generate a long random value and keep it only in Render.
 APP_SIGNING_SECRET = os.environ["APP_SIGNING_SECRET"]
 
-# CMD Sally V3 pilot: location + Sessions.
+# CMD Sally demo: location + Sessions.
 DEMO_GEO_ENABLED = os.environ.get("DEMO_GEO_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 DEMO_GEO_REAL_RADIUS_KM = float(os.environ.get("DEMO_GEO_REAL_RADIUS_KM", "250"))
 SESSION_STORAGE_ROOT = Path(os.environ.get("SESSION_STORAGE_ROOT", "/var/data/cmd-sally"))
@@ -1776,7 +1777,7 @@ def get_scoped_related_record(sf, salesforce_username, record_id, expected_role)
     if expected_role == "who":
         if object_type != "Contact":
             raise ValueError(
-                "For this pilot, Event WhoId may only reference a Salesforce Contact."
+                "For this pilot, WhoId may only reference a Salesforce Contact."
             )
 
         soql = (
@@ -1804,7 +1805,7 @@ def get_scoped_related_record(sf, salesforce_username, record_id, expected_role)
             )
         else:
             raise ValueError(
-                "For this pilot, Event WhatId may only reference an owned Opportunity "
+                "For this pilot, WhatId may only reference an owned Opportunity "
                 "or an Account connected to the user's opportunities."
             )
     else:
@@ -2045,7 +2046,14 @@ ALLOWED_OPPORTUNITY_WRITE_FIELDS = {
     "Amount",
     "Probability",
     "Description",
+    "Primary_Product__c",
+    "Confidence_Level__c",
+    "Add_to_Forecast__c",
+    "Comments__c",
 }
+
+ALLOWED_CONFIDENCE_LEVELS = {"0%", "10%", "25%", "50%", "75%", "90%", "100%"}
+ALLOWED_ADD_TO_FORECAST = {"Upside", "In", "Out"}
 
 
 def normalize_opportunity_write_value(field_name, new_value):
@@ -2087,12 +2095,31 @@ def normalize_opportunity_write_value(field_name, new_value):
             raise ValueError("Probability must be between 0 and 100.")
         return value
 
-    if field_name == "Description":
+    if field_name in {"Description", "Comments__c", "Primary_Product__c"}:
         if new_value is None:
             return None
         if not isinstance(new_value, str):
-            raise ValueError("Description must be text or null.")
-        return new_value
+            raise ValueError(f"{field_name} must be text or null.")
+        value = new_value.strip() if field_name == "Primary_Product__c" else new_value
+        if field_name == "Primary_Product__c" and not value:
+            return None
+        return value
+
+    if field_name == "Confidence_Level__c":
+        if new_value is None:
+            return None
+        value = str(new_value).strip()
+        if value not in ALLOWED_CONFIDENCE_LEVELS:
+            raise ValueError("Confidence_Level__c must be one of 0%, 10%, 25%, 50%, 75%, 90%, 100%, or null.")
+        return value
+
+    if field_name == "Add_to_Forecast__c":
+        if new_value is None:
+            return None
+        value = str(new_value).strip()
+        if value not in ALLOWED_ADD_TO_FORECAST:
+            raise ValueError("Add_to_Forecast__c must be Upside, In, Out, or null.")
+        return value
 
     raise ValueError("Unsupported opportunity field.")
 
@@ -2177,6 +2204,235 @@ def tool_propose_update_opportunity(
         ),
         "pending_action": action,
     }
+
+
+# ============================================================
+# OPPORTUNITY CREATE + TASK WRITE PROPOSALS (V4.1)
+# ============================================================
+
+def _validate_salesforce_id(record_id, expected_type, field_label):
+    value = str(record_id or "").strip()
+    if len(value) not in {15, 18} or not re.fullmatch(r"[A-Za-z0-9]+", value):
+        raise ValueError(f"{field_label} must be a valid Salesforce record Id.")
+    actual_type = salesforce_object_type_from_id(value)
+    if actual_type != expected_type:
+        raise ValueError(f"{field_label} must reference a Salesforce {expected_type}.")
+    return value
+
+
+def get_visible_account_for_opportunity_create(sf, account_id):
+    account_id = _validate_salesforce_id(account_id, "Account", "AccountId")
+    soql = (
+        "SELECT Id,Name,Industry,Website,Phone,BillingCity,BillingState,BillingCountry "
+        f"FROM Account WHERE Id='{soql_escape(account_id)}' LIMIT 1"
+    )
+    records = salesforce_query(sf["access_token"], sf["instance_url"], soql).get("records", [])
+    if not records:
+        raise ValueError("The Account is not visible to the authenticated Salesforce user.")
+    return format_account(records[0])
+
+
+def get_contact_for_opportunity_create(sf, account_id, contact_id):
+    if not contact_id:
+        return None
+    contact_id = _validate_salesforce_id(contact_id, "Contact", "Primary Contact")
+    account_id = _validate_salesforce_id(account_id, "Account", "AccountId")
+    soql = (
+        "SELECT Id,Name,Title,Department,Email,Phone,MobilePhone,AccountId,Account.Id,Account.Name "
+        f"FROM Contact WHERE Id='{soql_escape(contact_id)}' "
+        f"AND AccountId='{soql_escape(account_id)}' LIMIT 1"
+    )
+    records = salesforce_query(sf["access_token"], sf["instance_url"], soql).get("records", [])
+    if not records:
+        raise ValueError("The selected primary Contact is not on the selected Account or is not visible to this user.")
+    return format_contact(records[0])
+
+
+def normalize_opportunity_create_fields(args):
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise ValueError("Opportunity Name is required.")
+    # Salesforce Opportunity.Name is normally 120 chars. Reserve room for the auto-number suffix.
+    if len(name) > 95:
+        raise ValueError("Opportunity Name must be 95 characters or fewer before the SFDC project number is appended.")
+    account_id = _validate_salesforce_id(args.get("account_id"), "Account", "AccountId")
+    stage_name = normalize_opportunity_write_value("StageName", args.get("stage_name"))
+    close_date = normalize_opportunity_write_value("CloseDate", args.get("close_date"))
+    fields = {
+        "Name": name,
+        "AccountId": account_id,
+        "StageName": stage_name,
+        "CloseDate": close_date,
+    }
+    optional_map = {
+        "amount": "Amount",
+        "probability": "Probability",
+        "next_step": "NextStep",
+        "description": "Description",
+        "primary_product": "Primary_Product__c",
+        "confidence_level": "Confidence_Level__c",
+        "add_to_forecast": "Add_to_Forecast__c",
+        "comments": "Comments__c",
+    }
+    for arg_name, field_name in optional_map.items():
+        if args.get(arg_name) is not None:
+            fields[field_name] = normalize_opportunity_write_value(field_name, args.get(arg_name))
+    return fields
+
+
+def compose_opportunity_name_with_project_number(base_name, project_number):
+    base = str(base_name or "").strip()
+    project = str(project_number or "").strip()
+    if not project:
+        raise ValueError("Salesforce did not populate SFDC_Project_No__c after Opportunity creation.")
+    if base.lower().endswith(project.lower()):
+        return base[:120]
+    suffix = f" - {project}"
+    available = max(1, 120 - len(suffix))
+    return base[:available].rstrip() + suffix
+
+
+def get_owned_created_opportunity(sf, salesforce_username, opportunity_id):
+    opportunity_id = _validate_salesforce_id(opportunity_id, "Opportunity", "Opportunity Id")
+    soql = f"""SELECT Id,Name,SFDC_Project_No__c,StageName,Amount,CloseDate,Probability,NextStep,
+        Primary_Product__c,Confidence_Level__c,Add_to_Forecast__c,Comments__c,Description,
+        Account.Id,Account.Name,
+        (SELECT Id,Role,IsPrimary,Contact.Id,Contact.Name,Contact.Title,Contact.Department,Contact.Email,Contact.Phone,Contact.MobilePhone FROM OpportunityContactRoles)
+        FROM Opportunity WHERE Id='{soql_escape(opportunity_id)}' AND Owner.Username='{soql_escape(salesforce_username)}' LIMIT 1"""
+    records = salesforce_query(sf["access_token"], sf["instance_url"], " ".join(soql.split())).get("records", [])
+    if not records:
+        raise ValueError("The newly created Opportunity was not found in the authenticated user's scope.")
+    row = records[0]
+    roles = []
+    for role in (row.get("OpportunityContactRoles") or {}).get("records", []):
+        roles.append({"role": role.get("Role"), "is_primary": role.get("IsPrimary"), "contact": format_contact(role.get("Contact"))})
+    roles.sort(key=lambda r: (not bool(r.get("is_primary")), str((r.get("contact") or {}).get("name") or "")))
+    return {
+        "id": row.get("Id"), "name": row.get("Name"), "project_number": row.get("SFDC_Project_No__c"),
+        "stage": row.get("StageName"), "amount": row.get("Amount"), "close_date": row.get("CloseDate"),
+        "probability": row.get("Probability"), "next_step": row.get("NextStep"),
+        "primary_product": row.get("Primary_Product__c"), "confidence_level": row.get("Confidence_Level__c"),
+        "add_to_forecast": row.get("Add_to_Forecast__c"), "comments": row.get("Comments__c"),
+        "description": row.get("Description"), "account": format_account(row.get("Account")), "contacts": roles,
+        "primary_contact": next((r.get("contact") for r in roles if r.get("is_primary")), None),
+    }
+
+
+def tool_propose_create_opportunity(sf, salesforce_username, args):
+    fields = normalize_opportunity_create_fields(args)
+    account = get_visible_account_for_opportunity_create(sf, fields["AccountId"])
+    primary_contact = get_contact_for_opportunity_create(sf, fields["AccountId"], args.get("primary_contact_id"))
+    contact_role = str(args.get("contact_role") or "").strip()[:80] or None
+    action = {
+        "action": "create_opportunity",
+        "opportunity_name": fields["Name"],
+        "fields": fields,
+        "account": account,
+        "primary_contact": primary_contact,
+        "contact_role": contact_role,
+        "post_create_name_rule": "Append auto-generated SFDC_Project_No__c to Opportunity Name.",
+    }
+    return {
+        "ok": True,
+        "status": "pending_confirmation",
+        "message": "The Opportunity has NOT been created. After confirmation, Salesforce will generate the SFDC project number and Sally will append it to the end of the Opportunity Name.",
+        "pending_action": action,
+    }
+
+
+ALLOWED_TASK_WRITE_FIELDS = {"Subject", "ActivityDate", "Status", "Priority", "Description", "WhoId", "WhatId"}
+
+
+def normalize_task_write_value(field_name, new_value):
+    if field_name not in ALLOWED_TASK_WRITE_FIELDS:
+        raise ValueError(f"Task field {field_name} is not allowed for AI updates.")
+    if field_name == "Subject":
+        value = str(new_value or "").strip()
+        if not value:
+            raise ValueError("Task Subject must be non-empty text.")
+        return value[:255]
+    if field_name == "ActivityDate":
+        return validate_iso_date(new_value) if new_value is not None else None
+    if field_name == "Status":
+        value = str(new_value or "").strip()
+        if not value:
+            raise ValueError("Task Status must be non-empty text.")
+        return value[:100]
+    if field_name == "Priority":
+        value = str(new_value or "").strip()
+        if value not in {"High", "Normal", "Low"}:
+            raise ValueError("Task Priority must be High, Normal, or Low.")
+        return value
+    if field_name == "Description":
+        if new_value is None:
+            return None
+        if not isinstance(new_value, str):
+            raise ValueError("Task Description must be text or null.")
+        return new_value
+    if field_name in {"WhoId", "WhatId"}:
+        if new_value is None:
+            return None
+        value = str(new_value).strip()
+        if len(value) not in {15, 18} or not re.fullmatch(r"[A-Za-z0-9]+", value):
+            raise ValueError(f"Task {field_name} must be a Salesforce record Id or null.")
+        return value
+    raise ValueError("Unsupported Task field.")
+
+
+def get_owned_task(sf, salesforce_username, task_id):
+    task_id = _validate_salesforce_id(task_id, "Task", "Task Id")
+    soql = (
+        "SELECT Id,Subject,ActivityDate,Status,Priority,Description,IsClosed,WhoId,WhatId,Who.Name,What.Name,OwnerId,Owner.Name,Owner.Username "
+        f"FROM Task WHERE Id='{soql_escape(task_id)}' AND Owner.Username='{soql_escape(salesforce_username)}' LIMIT 1"
+    )
+    records = salesforce_query(sf["access_token"], sf["instance_url"], soql).get("records", [])
+    if not records:
+        raise ValueError("Task was not found in the authenticated user's owned Salesforce Tasks.")
+    return format_task(records[0])
+
+
+def get_owned_task_field(sf, salesforce_username, task_id, field_name):
+    if field_name not in ALLOWED_TASK_WRITE_FIELDS:
+        raise ValueError("Task field is not allowed.")
+    task_id = _validate_salesforce_id(task_id, "Task", "Task Id")
+    soql = (
+        f"SELECT Id,Subject,{field_name} FROM Task WHERE Id='{soql_escape(task_id)}' "
+        f"AND Owner.Username='{soql_escape(salesforce_username)}' LIMIT 1"
+    )
+    records = salesforce_query(sf["access_token"], sf["instance_url"], soql).get("records", [])
+    if not records:
+        raise ValueError("Task was not found in the authenticated user's owned Salesforce Tasks.")
+    row = records[0]
+    return {"id": row.get("Id"), "subject": row.get("Subject"), "field_name": field_name, "current_value": row.get(field_name)}
+
+
+def tool_propose_create_task(sf, salesforce_username, args):
+    fields = {
+        "Subject": normalize_task_write_value("Subject", args.get("subject")),
+        "Status": normalize_task_write_value("Status", args.get("status") or "Not Started"),
+        "Priority": normalize_task_write_value("Priority", args.get("priority") or "Normal"),
+    }
+    optional_map = {"activity_date": "ActivityDate", "description": "Description", "who_id": "WhoId", "what_id": "WhatId"}
+    for arg_name, field_name in optional_map.items():
+        if args.get(arg_name) is not None:
+            fields[field_name] = normalize_task_write_value(field_name, args.get(arg_name))
+    who = get_scoped_related_record(sf, salesforce_username, fields.get("WhoId"), "who") if fields.get("WhoId") else None
+    what = get_scoped_related_record(sf, salesforce_username, fields.get("WhatId"), "what") if fields.get("WhatId") else None
+    action = {"action": "create_task", "task_subject": fields["Subject"], "fields": fields, "who": who, "what": what}
+    return {"ok": True, "status": "pending_confirmation", "message": "The Task has NOT been created in Salesforce. It is queued for explicit user confirmation.", "pending_action": action}
+
+
+def tool_propose_update_task(sf, salesforce_username, args):
+    task_id = args.get("task_id")
+    field_name = args.get("field_name")
+    new_value = normalize_task_write_value(field_name, args.get("new_value"))
+    current = get_owned_task_field(sf, salesforce_username, task_id, field_name)
+    if field_name == "WhoId" and new_value:
+        get_scoped_related_record(sf, salesforce_username, new_value, "who")
+    elif field_name == "WhatId" and new_value:
+        get_scoped_related_record(sf, salesforce_username, new_value, "what")
+    action = {"action": "update_task", "task_id": current["id"], "task_subject": current["subject"], "field_name": field_name, "old_value": current["current_value"], "new_value": new_value}
+    return {"ok": True, "status": "pending_confirmation", "message": "The Task update has NOT been written to Salesforce. It is queued for explicit user confirmation.", "pending_action": action}
 
 
 # ============================================================
@@ -2291,6 +2547,10 @@ CRM_WRITE_TOOLS = [
                         "Amount",
                         "Probability",
                         "Description",
+                        "Primary_Product__c",
+                        "Confidence_Level__c",
+                        "Add_to_Forecast__c",
+                        "Comments__c",
                     ],
                 },
                 "new_value": {
@@ -2302,6 +2562,74 @@ CRM_WRITE_TOOLS = [
                 },
             },
             "required": ["opportunity_id", "field_name", "new_value"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_create_opportunity",
+        "description": (
+            "Propose creating an Opportunity on a visible Salesforce Account. This NEVER writes immediately. "
+            "Do not provide SFDC_Project_No__c: Salesforce auto-generates it. After confirmation the backend reads "
+            "the generated project number and appends it to the end of Opportunity Name. Optionally link a primary "
+            "Contact through standard OpportunityContactRole."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "account_id": {"type": "string"},
+                "stage_name": {"type": "string"},
+                "close_date": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "amount": {"type": ["number", "null"]},
+                "probability": {"type": ["number", "null"]},
+                "next_step": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "primary_product": {"type": ["string", "null"]},
+                "confidence_level": {"type": ["string", "null"], "enum": ["0%", "10%", "25%", "50%", "75%", "90%", "100%", None]},
+                "add_to_forecast": {"type": ["string", "null"], "enum": ["Upside", "In", "Out", None]},
+                "comments": {"type": ["string", "null"]},
+                "primary_contact_id": {"type": ["string", "null"]},
+                "contact_role": {"type": ["string", "null"]},
+            },
+            "required": ["name", "account_id", "stage_name", "close_date", "amount", "probability", "next_step", "description", "primary_product", "confidence_level", "add_to_forecast", "comments", "primary_contact_id", "contact_role"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_create_task",
+        "description": "Propose creating a Salesforce Task/reminder. This NEVER writes immediately. Use Task, not Event, for reminders, calls, follow-ups and to-dos that are not scheduled meetings.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "activity_date": {"type": ["string", "null"], "description": "Due date YYYY-MM-DD"},
+                "status": {"type": ["string", "null"], "description": "Usually Not Started unless user requested another status."},
+                "priority": {"type": ["string", "null"], "enum": ["High", "Normal", "Low", None]},
+                "description": {"type": ["string", "null"]},
+                "who_id": {"type": ["string", "null"]},
+                "what_id": {"type": ["string", "null"]},
+            },
+            "required": ["subject", "activity_date", "status", "priority", "description", "who_id", "what_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_update_task",
+        "description": "Propose changing ONE allowed field on an owned Salesforce Task. This NEVER writes immediately; it requires explicit confirmation.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "field_name": {"type": "string", "enum": ["Subject", "ActivityDate", "Status", "Priority", "Description", "WhoId", "WhatId"]},
+                "new_value": {"type": ["string", "null"]},
+            },
+            "required": ["task_id", "field_name", "new_value"],
             "additionalProperties": False,
         },
     },
@@ -2452,6 +2780,15 @@ def run_function_tool(
                 arguments,
             )
 
+        if tool_name == "propose_create_opportunity":
+            return tool_propose_create_opportunity(sf, salesforce_username, arguments)
+
+        if tool_name == "propose_create_task":
+            return tool_propose_create_task(sf, salesforce_username, arguments)
+
+        if tool_name == "propose_update_task":
+            return tool_propose_update_task(sf, salesforce_username, arguments)
+
         if tool_name == "propose_create_event":
             return tool_propose_create_event(
                 sf,
@@ -2490,11 +2827,13 @@ BASE_CAPABILITY_MANIFEST = {
         "search_accounts": True,
         "search_contacts": True,
         "update_opportunities": True,
+        "create_opportunities": True,
         "search_events": True,
         "search_tasks": True,
         "create_events": True,
         "update_events": True,
-        "create_tasks": False,
+        "create_tasks": True,
+        "update_tasks": True,
         "send_email": False,
     },
     "web_research": True,
@@ -2542,8 +2881,11 @@ def current_capabilities():
     capabilities["salesforce"]["search_events"] = read_on
     capabilities["salesforce"]["search_tasks"] = read_on
     capabilities["salesforce"]["update_opportunities"] = write_on
+    capabilities["salesforce"]["create_opportunities"] = write_on
     capabilities["salesforce"]["create_events"] = write_on
     capabilities["salesforce"]["update_events"] = write_on
+    capabilities["salesforce"]["create_tasks"] = write_on
+    capabilities["salesforce"]["update_tasks"] = write_on
     capabilities["web_research"] = flags.get("web_research", True)
     capabilities["location"]["foreground_gps"] = flags.get("location", True)
     capabilities["location"]["demo_geography_adapter"] = flags.get("demo_geography", DEMO_GEO_ENABLED)
@@ -2930,7 +3272,10 @@ Web:
 
 Writes:
 - Write-capable tools only PROPOSE changes; they never write immediately.
-- Supported write proposals are Opportunity updates, Event creation, and Event updates.
+- Supported write proposals are Opportunity creation/updates, Event creation/updates, and Task creation/updates.
+- Use Tasks for reminders, calls, follow-ups and to-dos; use Events for scheduled meetings/appointments.
+- When creating an Opportunity, never invent or supply SFDC_Project_No__c. Salesforce generates it; the backend appends it to Opportunity Name after creation.
+- Opportunity Contacts are linked through standard OpportunityContactRole, not a custom Contact lookup.
 - Never say Salesforce was updated/created until the backend confirmation endpoint
   reports success.
 - If changes are pending, summarize exactly what would change and tell the user
@@ -2940,6 +3285,8 @@ Presentation:
 - The mobile UI renders structured CRM results separately from your prose.
 - Do NOT dump Salesforce rows into a long prose list or Markdown table.
 - display_text should explain the result, highlight conclusions, and stay concise.
+- Use lightweight Markdown for emphasis in display_text: **bold** and *italic*. Do not emit HTML tags such as <b>, <strong>, <i>, <em>, or <u>.
+- Do not put raw URLs in display_text. Web sources are rendered separately by the client from web_sources.
 - speech_text is private text for device TTS and is NOT displayed. It must sound
   natural when spoken. Do not read tables, URLs, Salesforce IDs, citations, or
   long lists unless the user explicitly asked you to read them. Prefer totals,
@@ -3064,10 +3411,18 @@ def dedupe_pending_actions(actions):
                 action.get("field_name"),
                 json.dumps(action.get("new_value"), sort_keys=True),
             )
-        elif action_type == "create_event":
+        elif action_type in {"create_event", "create_opportunity", "create_task"}:
             key = (
                 action_type,
                 json.dumps(action.get("fields") or {}, sort_keys=True),
+                action.get("primary_contact", {}).get("id") if isinstance(action.get("primary_contact"), dict) else None,
+            )
+        elif action_type == "update_task":
+            key = (
+                action_type,
+                action.get("task_id"),
+                action.get("field_name"),
+                json.dumps(action.get("new_value"), sort_keys=True),
             )
         else:
             key = (action_type, json.dumps(action, sort_keys=True, default=str))
@@ -3582,6 +3937,13 @@ def execute_agent(
 # WRITE CONFIRMATION
 # ============================================================
 
+class SalesforcePartialWriteError(Exception):
+    """A Salesforce create occurred, but a required post-create verification/finalization failed."""
+    def __init__(self, message, partial_results=None):
+        super().__init__(message)
+        self.partial_results = partial_results or []
+
+
 def decode_confirmation_token(token):
     return jwt.decode(
         token,
@@ -3645,6 +4007,52 @@ def execute_confirmed_actions(claims, token_payload):
                 "old_value": current["current_value"],
                 "new_value": new_value,
             })
+            continue
+
+        if action_type == "create_opportunity":
+            raw_fields = action.get("fields") or {}
+            fields = normalize_opportunity_create_fields({
+                "name": raw_fields.get("Name"), "account_id": raw_fields.get("AccountId"),
+                "stage_name": raw_fields.get("StageName"), "close_date": raw_fields.get("CloseDate"),
+                "amount": raw_fields.get("Amount"), "probability": raw_fields.get("Probability"),
+                "next_step": raw_fields.get("NextStep"), "description": raw_fields.get("Description"),
+                "primary_product": raw_fields.get("Primary_Product__c"), "confidence_level": raw_fields.get("Confidence_Level__c"),
+                "add_to_forecast": raw_fields.get("Add_to_Forecast__c"), "comments": raw_fields.get("Comments__c"),
+            })
+            account = get_visible_account_for_opportunity_create(sf, fields["AccountId"])
+            primary_contact = action.get("primary_contact") or None
+            if primary_contact and primary_contact.get("id"):
+                primary_contact = get_contact_for_opportunity_create(sf, fields["AccountId"], primary_contact.get("id"))
+            validated.append({
+                "action": action_type, "fields": fields, "account": account,
+                "primary_contact": primary_contact, "contact_role": str(action.get("contact_role") or "").strip()[:80] or None,
+            })
+            continue
+
+        if action_type == "create_task":
+            raw_fields = action.get("fields") or {}
+            fields = {}
+            for field_name, value in raw_fields.items():
+                fields[field_name] = normalize_task_write_value(field_name, value)
+            if fields.get("WhoId"):
+                get_scoped_related_record(sf, salesforce_username, fields["WhoId"], "who")
+            if fields.get("WhatId"):
+                get_scoped_related_record(sf, salesforce_username, fields["WhatId"], "what")
+            validated.append({"action": action_type, "fields": fields, "task_subject": fields.get("Subject")})
+            continue
+
+        if action_type == "update_task":
+            task_id = action.get("task_id")
+            field_name = action.get("field_name")
+            new_value = normalize_task_write_value(field_name, action.get("new_value"))
+            current = get_owned_task_field(sf, salesforce_username, task_id, field_name)
+            if not values_equivalent(current["current_value"], action.get("old_value")):
+                raise ValueError(f"Conflict: Task '{current['subject']}' → {field_name} changed after the proposal was created. No writes were executed.")
+            if field_name == "WhoId" and new_value:
+                get_scoped_related_record(sf, salesforce_username, new_value, "who")
+            elif field_name == "WhatId" and new_value:
+                get_scoped_related_record(sf, salesforce_username, new_value, "what")
+            validated.append({"action": action_type, "task_id": current["id"], "task_subject": current["subject"], "field_name": field_name, "old_value": current["current_value"], "new_value": new_value})
             continue
 
         if action_type == "create_event":
@@ -3734,6 +4142,65 @@ def execute_confirmed_actions(claims, token_payload):
             })
             continue
 
+        if action_type == "create_opportunity":
+            opportunity_id = salesforce_create_record(sf["access_token"], sf["instance_url"], "Opportunity", action["fields"])
+            project_number = None
+            final_name = action["fields"].get("Name")
+            try:
+                created = get_owned_created_opportunity(sf, salesforce_username, opportunity_id)
+                project_number = created.get("project_number")
+                final_name = compose_opportunity_name_with_project_number(action["fields"]["Name"], project_number)
+                if created.get("name") != final_name:
+                    salesforce_update_record(sf["access_token"], sf["instance_url"], "Opportunity", opportunity_id, {"Name": final_name})
+                if action.get("primary_contact") and action["primary_contact"].get("id"):
+                    role_fields = {"OpportunityId": opportunity_id, "ContactId": action["primary_contact"]["id"], "IsPrimary": True}
+                    if action.get("contact_role"):
+                        role_fields["Role"] = action["contact_role"]
+                    salesforce_create_record(sf["access_token"], sf["instance_url"], "OpportunityContactRole", role_fields)
+                verified = get_owned_created_opportunity(sf, salesforce_username, opportunity_id)
+                if verified.get("project_number") != project_number or verified.get("name") != final_name:
+                    raise ValueError("SFDC project-number name finalization could not be verified.")
+                expected_contact = (action.get("primary_contact") or {}).get("id")
+                if expected_contact and (verified.get("primary_contact") or {}).get("id") != expected_contact:
+                    raise ValueError("Primary Opportunity Contact Role could not be verified.")
+            except Exception as exc:
+                raise SalesforcePartialWriteError(
+                    f"Salesforce created Opportunity {opportunity_id}, but post-create finalization failed: {exc}. Do NOT confirm the same create again; inspect the created record first.",
+                    [{"action": action_type, "opportunity_id": opportunity_id, "opportunity_name": final_name, "project_number": project_number, "status": "created_partial"}],
+                ) from exc
+            results.append({"action": action_type, "opportunity_id": opportunity_id, "opportunity_name": verified.get("name"), "project_number": project_number, "status": "created_and_verified", "opportunity": verified})
+            continue
+
+        if action_type == "create_task":
+            task_id = salesforce_create_record(sf["access_token"], sf["instance_url"], "Task", action["fields"])
+            try:
+                task = get_owned_task(sf, salesforce_username, task_id)
+                field_map = {"Subject": "subject", "ActivityDate": "activity_date", "Status": "status", "Priority": "priority", "Description": "description"}
+                for field_name, expected in action["fields"].items():
+                    if field_name == "WhoId":
+                        actual = (task.get("who") or {}).get("id")
+                    elif field_name == "WhatId":
+                        actual = (task.get("what") or {}).get("id")
+                    else:
+                        actual = task.get(field_map.get(field_name))
+                    if not values_equivalent(actual, expected):
+                        raise ValueError(f"Salesforce Task creation could not be verified for {field_name}.")
+            except Exception as exc:
+                raise SalesforcePartialWriteError(
+                    f"Salesforce created Task {task_id}, but read-back verification failed: {exc}. Do NOT confirm the same create again; inspect the Task first.",
+                    [{"action": action_type, "task_id": task_id, "task_subject": action["fields"].get("Subject"), "status": "created_partial"}],
+                ) from exc
+            results.append({"action": action_type, "task_id": task_id, "task_subject": task.get("subject"), "status": "created_and_verified", "task": task})
+            continue
+
+        if action_type == "update_task":
+            salesforce_update_record(sf["access_token"], sf["instance_url"], "Task", action["task_id"], {action["field_name"]: action["new_value"]})
+            verified = get_owned_task_field(sf, salesforce_username, action["task_id"], action["field_name"])
+            if not values_equivalent(verified["current_value"], action["new_value"]):
+                raise ValueError("Salesforce Task update could not be verified.")
+            results.append({**action, "status": "updated_and_verified", "verified_value": verified["current_value"]})
+            continue
+
         if action_type == "create_event":
             event_id = salesforce_create_record(
                 sf["access_token"],
@@ -3741,33 +4208,38 @@ def execute_confirmed_actions(claims, token_payload):
                 "Event",
                 action["fields"],
             )
+            try:
+                event = get_owned_event(sf, salesforce_username, event_id)
 
-            event = get_owned_event(sf, salesforce_username, event_id)
+                for field_name, expected in action["fields"].items():
+                    actual_key = {
+                        "Subject": "subject",
+                        "StartDateTime": "start_datetime",
+                        "EndDateTime": "end_datetime",
+                        "ActivityDate": "activity_date",
+                        "IsAllDayEvent": "is_all_day_event",
+                        "Location": "location",
+                        "Description": "description",
+                        "WhoId": None,
+                        "WhatId": None,
+                    }.get(field_name)
 
-            for field_name, expected in action["fields"].items():
-                actual_key = {
-                    "Subject": "subject",
-                    "StartDateTime": "start_datetime",
-                    "EndDateTime": "end_datetime",
-                    "ActivityDate": "activity_date",
-                    "IsAllDayEvent": "is_all_day_event",
-                    "Location": "location",
-                    "Description": "description",
-                    "WhoId": None,
-                    "WhatId": None,
-                }.get(field_name)
+                    if field_name == "WhoId":
+                        actual = (event.get("who") or {}).get("id")
+                    elif field_name == "WhatId":
+                        actual = (event.get("what") or {}).get("id")
+                    else:
+                        actual = event.get(actual_key)
 
-                if field_name == "WhoId":
-                    actual = (event.get("who") or {}).get("id")
-                elif field_name == "WhatId":
-                    actual = (event.get("what") or {}).get("id")
-                else:
-                    actual = event.get(actual_key)
-
-                if not values_equivalent(actual, expected):
-                    raise ValueError(
-                        f"Salesforce Event creation could not be verified for {field_name}."
-                    )
+                    if not values_equivalent(actual, expected):
+                        raise ValueError(
+                            f"Salesforce Event creation could not be verified for {field_name}."
+                        )
+            except Exception as exc:
+                raise SalesforcePartialWriteError(
+                    f"Salesforce created Event {event_id}, but read-back verification failed: {exc}. Do NOT confirm the same create again; inspect the Event first.",
+                    [{"action": action_type, "event_id": event_id, "event_subject": action["fields"].get("Subject"), "status": "created_partial"}],
+                ) from exc
 
             results.append({
                 "action": action_type,
@@ -4301,7 +4773,7 @@ def root():
     return jsonify({
         "service": "CMD Sally API",
         "status": "running",
-        "version": "cmd-sally-v4-demo",
+        "version": APP_VERSION,
     })
 
 
@@ -4309,7 +4781,7 @@ def root():
 def health():
     return jsonify({
         "ok": True,
-        "version": "cmd-sally-v4-demo",
+        "version": APP_VERSION,
         "session_storage_root": str(SESSION_STORAGE_ROOT),
         "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
         "demo_geo_enabled": feature_enabled("demo_geography", DEMO_GEO_ENABLED),
@@ -4874,6 +5346,8 @@ def confirm():
                     "status": item.get("status"),
                     "opportunity_id": item.get("opportunity_id"),
                     "event_id": item.get("event_id"),
+                    "task_id": item.get("task_id"),
+                    "project_number": item.get("project_number"),
                 },
             )
 
@@ -4883,6 +5357,21 @@ def confirm():
             "updated_count": len(results),
             "results": results,
         })
+
+    except SalesforcePartialWriteError as e:
+        for item in e.partial_results:
+            audit_log(
+                "salesforce_write_partial",
+                owner_oid=request.user_claims.get("oid"),
+                salesforce_username=request.user_claims.get("preferred_username"),
+                summary=f"{item.get('action') or 'salesforce_create'} partially completed",
+                details=item,
+            )
+        return jsonify({
+            "error": "confirmation_partial",
+            "details": str(e),
+            "partial_results": e.partial_results,
+        }), 409
 
     except jwt.ExpiredSignatureError:
         return jsonify({
@@ -5052,7 +5541,7 @@ def admin_overview():
         jobs = [_job_public(j, include_result=False) | {"salesforce_username": j.get("salesforce_username")} for j in CHAT_JOBS.values()]
     jobs.sort(key=lambda j: j.get("updated_at") or "", reverse=True)
     return jsonify({
-        "version": "cmd-sally-v4-demo", "service": "CMD Sally API", "storage_root": str(SESSION_STORAGE_ROOT),
+        "version": APP_VERSION, "service": "CMD Sally API", "storage_root": str(SESSION_STORAGE_ROOT),
         "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
         "feature_flags": get_feature_flags(), "forced_demo_cluster": get_config_setting("demo_geo_force_cluster", "automatic"),
         "sessions": session_counts, "audit_events_today": audit_today, "requests_today": requests_today,
