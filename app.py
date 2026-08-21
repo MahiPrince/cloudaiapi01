@@ -7,6 +7,7 @@ import hashlib
 import sqlite3
 import threading
 import uuid
+import wave
 import subprocess
 import shutil
 import hmac
@@ -35,7 +36,7 @@ import imageio_ffmpeg
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
-APP_VERSION = "cmd-sally-v4.1-demo"
+APP_VERSION = "cmd-sally-v4.2a-demo"
 
 
 # ============================================================
@@ -67,6 +68,9 @@ SESSION_STORAGE_ROOT = Path(os.environ.get("SESSION_STORAGE_ROOT", "/var/data/cm
 SESSION_AUTO_LINK_THRESHOLD = float(os.environ.get("SESSION_AUTO_LINK_THRESHOLD", "0.82"))
 MAX_OPENAI_AUDIO_BYTES = 24_000_000  # leave headroom below the 25 MB API ceiling
 SESSION_CHUNK_SECONDS = int(os.environ.get("SESSION_CHUNK_SECONDS", "1200"))
+VOICEPUCK_TICKET_TTL_SECONDS = max(300, min(int(os.environ.get("VOICEPUCK_TICKET_TTL_SECONDS", "1800")), 7200))
+VOICEPUCK_MAX_CHUNK_BYTES = max(1_000_000, min(int(os.environ.get("VOICEPUCK_MAX_CHUNK_BYTES", "16000000")), 32_000_000))
+VOICEPUCK_MAX_SESSION_BYTES = max(VOICEPUCK_MAX_CHUNK_BYTES, min(int(os.environ.get("VOICEPUCK_MAX_SESSION_BYTES", "1000000000")), 2_000_000_000))
 
 # Demo admin console. No default password is provided: /admin remains unavailable
 # until these values are configured in Render.
@@ -110,8 +114,10 @@ _ensure_session_storage()
 SESSION_DB_PATH = SESSION_STORAGE_ROOT / "sessions.db"
 SESSION_AUDIO_ROOT = SESSION_STORAGE_ROOT / "sessions"
 SESSION_DELETED_ROOT = SESSION_STORAGE_ROOT / "deleted_sessions"
+VOICEPUCK_STAGING_ROOT = SESSION_STORAGE_ROOT / "voicepuck_staging"
 SESSION_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
 SESSION_DELETED_ROOT.mkdir(parents=True, exist_ok=True)
+VOICEPUCK_STAGING_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def session_db():
@@ -177,6 +183,25 @@ def init_session_db():
                 details_json TEXT
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS voicepuck_sync_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                secret_hash TEXT NOT NULL,
+                owner_oid TEXT NOT NULL,
+                salesforce_username TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                manifest_json TEXT,
+                received_json TEXT,
+                recording_location_json TEXT,
+                server_ack_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_voicepuck_owner_session ON voicepuck_sync_tickets(owner_oid, session_id)")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS config_feature_flags (
                 key TEXT PRIMARY KEY,
@@ -247,6 +272,7 @@ def seed_demo_admin_config():
         "demo_geography": DEMO_GEO_ENABLED,
         "long_research": True,
         "voice_chat": True,
+        "voicepuck": True,
     }
     default_workflows = [
         ("nearby_visit", "Nearby Visit", "Recover field time by finding useful nearby customer stops.", ["who can I visit near me", "nearby customers", "meeting cancelled"], ["Resolve effective location", "Query open-opportunity accounts", "Rank by distance and pipeline", "Return contact and opportunity context"], ["location", "Salesforce"], 0, 1),
@@ -450,6 +476,108 @@ def safe_session_id(value):
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,96}", raw):
         raise ValueError("Invalid session id.")
     return raw
+
+def safe_device_id(value):
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{3,96}", raw):
+        raise ValueError("Invalid VoicePuck device id.")
+    return raw
+
+
+def _voicepuck_secret_hash(secret):
+    return hashlib.sha256(str(secret or "").encode("utf-8")).hexdigest()
+
+
+def _iso_epoch(value):
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _voicepuck_ticket_row(ticket_id):
+    raw = str(ticket_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{12,64}", raw):
+        raise ValueError("Invalid VoicePuck ticket id.")
+    with session_db() as conn:
+        return conn.execute("SELECT * FROM voicepuck_sync_tickets WHERE ticket_id=?", (raw,)).fetchone()
+
+
+def verify_voicepuck_ticket(ticket_id, supplied_secret, expected_session_id=None, allow_completed=False):
+    row = _voicepuck_ticket_row(ticket_id)
+    if not row:
+        raise ValueError("VoicePuck sync ticket not found.")
+    expected_hash = str(row["secret_hash"] or "")
+    actual_hash = _voicepuck_secret_hash(supplied_secret)
+    if not expected_hash or not hmac.compare_digest(expected_hash, actual_hash):
+        raise PermissionError("VoicePuck sync ticket secret is invalid.")
+    if _iso_epoch(row["expires_at"]) < time.time():
+        raise PermissionError("VoicePuck sync ticket expired.")
+    if expected_session_id and str(row["session_id"]) != safe_session_id(expected_session_id):
+        raise PermissionError("VoicePuck ticket is not valid for this Session.")
+    if not allow_completed and row["state"] in {"completed", "revoked"}:
+        raise PermissionError("VoicePuck sync ticket is no longer writable.")
+    return row
+
+
+def voicepuck_ticket_public(row):
+    if not row:
+        return None
+    manifest = json.loads(row["manifest_json"] or "null")
+    received = json.loads(row["received_json"] or "[]") or []
+    chunks = (manifest or {}).get("chunks") or []
+    return {
+        "ticket_id": row["ticket_id"],
+        "device_id": row["device_id"],
+        "session_id": row["session_id"],
+        "state": row["state"],
+        "received_chunks": len(received),
+        "total_chunks": len(chunks),
+        "received_indices": received,
+        "server_ack_id": row["server_ack_id"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def recover_completed_voicepuck_sync(owner_oid, device_id, session_id):
+    """Return a previously verified VoicePuck ACK after phone reconnect.
+
+    The server only returns an ACK when the authenticated owner already has a
+    stored VoicePuck Session for this exact device AND a completed sync ticket
+    with a server_ack_id. This lets the phone finish the final delete handshake
+    without re-uploading audio or creating a duplicate Session.
+    """
+    owner_oid = str(owner_oid or "")
+    device_id = safe_device_id(device_id)
+    session_id = safe_session_id(session_id)
+    with session_db() as conn:
+        session_row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id=? AND owner_oid=? AND deleted_at IS NULL",
+            (session_id, owner_oid),
+        ).fetchone()
+        if not session_row:
+            return None
+        if str(session_row["source"] or "") != "voicepuck":
+            raise PermissionError("Existing Session is not a VoicePuck recording.")
+        stored_vp = json.loads(session_row["voicepuck_json"] or "null") or {}
+        stored_device = str(stored_vp.get("device_id") or "")
+        if stored_device and stored_device != device_id:
+            raise PermissionError("Existing VoicePuck Session belongs to a different device.")
+        audio_path = Path(str(session_row["audio_path"] or "")) if session_row["audio_path"] else None
+        if not audio_path or not audio_path.exists() or audio_path.stat().st_size < 44:
+            raise RuntimeError("Stored VoicePuck Session audio could not be verified on disk.")
+        ticket_row = conn.execute(
+            """SELECT * FROM voicepuck_sync_tickets
+               WHERE owner_oid=? AND session_id=? AND device_id=?
+                 AND state='completed' AND server_ack_id IS NOT NULL
+               ORDER BY updated_at DESC LIMIT 1""",
+            (owner_oid, session_id, device_id),
+        ).fetchone()
+    if not ticket_row:
+        raise RuntimeError("VoicePuck Session exists, but no completed server ACK is available for safe deletion.")
+    return voicepuck_ticket_public(ticket_row)
 
 
 def owner_session_row(session_id, owner_oid):
@@ -2848,7 +2976,7 @@ BASE_CAPABILITY_MANIFEST = {
         "diarized_transcription": True,
         "opportunity_linking": True,
         "soft_delete": True,
-        "voicepuck": "prototype_not_connected",
+        "voicepuck": "v4.2a_ble_wifi_prototype",
     },
     "voice": {
         "ask_sally": True,
@@ -2891,6 +3019,7 @@ def current_capabilities():
     capabilities["location"]["demo_geography_adapter"] = flags.get("demo_geography", DEMO_GEO_ENABLED)
     capabilities["sessions"]["iphone_recording"] = flags.get("session_recording", True)
     capabilities["sessions"]["soft_delete"] = flags.get("session_soft_delete", True)
+    capabilities["sessions"]["voicepuck"] = "v4.2a_ble_wifi_prototype" if flags.get("voicepuck", True) else False
     capabilities["voice"]["ask_sally"] = flags.get("voice_chat", True)
     capabilities["research"]["long_research"] = flags.get("long_research", True)
     return capabilities
@@ -4765,6 +4894,303 @@ def restore_archived_session(session_id):
 
 
 # ============================================================
+# VOICEPUCK V4.2A — BLE CONTROL + HTTPS CHUNK SYNC
+# ============================================================
+
+
+def _voicepuck_manifest_validate(payload, expected_session_id, expected_device_id):
+    if not isinstance(payload, dict):
+        raise ValueError("VoicePuck manifest must be a JSON object.")
+    session_id = safe_session_id(payload.get("session_id"))
+    device_id = safe_device_id(payload.get("device_id"))
+    if session_id != expected_session_id or device_id != expected_device_id:
+        raise ValueError("VoicePuck manifest identity does not match the issued ticket.")
+    sample_rate = int(payload.get("sample_rate") or 0)
+    channels = int(payload.get("channels") or 0)
+    bits_per_sample = int(payload.get("bits_per_sample") or 0)
+    codec = str(payload.get("codec") or "").lower()
+    if (sample_rate, channels, bits_per_sample, codec) != (16000, 1, 16, "pcm_wav"):
+        raise ValueError("V4.2A VoicePuck requires 16 kHz / mono / 16-bit PCM WAV chunks.")
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list) or not chunks or len(chunks) > 96:
+        raise ValueError("VoicePuck manifest must contain 1-96 chunks.")
+    seen = set()
+    total_bytes = 0
+    normalized = []
+    for item in chunks:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid VoicePuck chunk manifest entry.")
+        index = int(item.get("index"))
+        if index < 0 or index >= 96 or index in seen:
+            raise ValueError("VoicePuck chunk indices must be unique and between 0 and 95.")
+        seen.add(index)
+        size = int(item.get("bytes") or 0)
+        if size < 44 or size > VOICEPUCK_MAX_CHUNK_BYTES:
+            raise ValueError(f"VoicePuck chunk {index} has an invalid size.")
+        digest = str(item.get("sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"VoicePuck chunk {index} has an invalid SHA-256.")
+        total_bytes += size
+        if total_bytes > VOICEPUCK_MAX_SESSION_BYTES:
+            raise ValueError("VoicePuck Session exceeds the pilot upload size limit.")
+        normalized.append({"index": index, "bytes": size, "sha256": digest})
+    normalized.sort(key=lambda x: x["index"])
+    if [c["index"] for c in normalized] != list(range(len(normalized))):
+        raise ValueError("VoicePuck chunk indices must be contiguous starting at 0.")
+    out = {
+        "schema": "cmd-sally-voicepuck-manifest-v1",
+        "session_id": session_id,
+        "device_id": device_id,
+        "source": "voicepuck",
+        "started_at": payload.get("started_at"),
+        "ended_at": payload.get("ended_at"),
+        "duration_ms": max(0, int(payload.get("duration_ms") or 0)),
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "bits_per_sample": bits_per_sample,
+        "codec": codec,
+        "firmware_version": str(payload.get("firmware_version") or "unknown")[:80],
+        "chunks": normalized,
+    }
+    return out
+
+
+def _voicepuck_staging_dir(row):
+    owner = re.sub(r"[^A-Za-z0-9_-]", "_", str(row["owner_oid"]))
+    return VOICEPUCK_STAGING_ROOT / owner / str(row["ticket_id"])
+
+
+def _stitch_voicepuck_wavs(ticket_row, manifest):
+    staging = _voicepuck_staging_dir(ticket_row)
+    owner = re.sub(r"[^A-Za-z0-9_-]", "_", str(ticket_row["owner_oid"]))
+    session_id = safe_session_id(ticket_row["session_id"])
+    final_dir = SESSION_AUDIO_ROOT / owner / session_id
+    final_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = final_dir / "original.wav.tmp"
+    final_path = final_dir / "original.wav"
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    expected = (1, 2, 16000)
+    total_frames = 0
+    with wave.open(str(tmp_path), "wb") as out_wav:
+        out_wav.setnchannels(expected[0])
+        out_wav.setsampwidth(expected[1])
+        out_wav.setframerate(expected[2])
+        for chunk in manifest["chunks"]:
+            path = staging / f"chunk_{chunk['index']:03d}.wav"
+            if not path.exists():
+                raise RuntimeError(f"VoicePuck chunk {chunk['index']} is missing.")
+            if path.stat().st_size != int(chunk["bytes"]):
+                raise RuntimeError(f"VoicePuck chunk {chunk['index']} size changed after verification.")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != chunk["sha256"]:
+                raise RuntimeError(f"VoicePuck chunk {chunk['index']} checksum changed after verification.")
+            with wave.open(str(path), "rb") as in_wav:
+                params = (in_wav.getnchannels(), in_wav.getsampwidth(), in_wav.getframerate())
+                if params != expected or in_wav.getcomptype() != "NONE":
+                    raise RuntimeError("VoicePuck chunk audio format does not match the V4.2A PCM contract.")
+                frames = in_wav.readframes(in_wav.getnframes())
+                total_frames += in_wav.getnframes()
+                out_wav.writeframes(frames)
+    tmp_path.replace(final_path)
+    duration_ms = int(round(total_frames * 1000 / 16000))
+    return final_path, duration_ms
+
+
+def _voicepuck_device_secret():
+    return request.headers.get("X-VoicePuck-Secret", "")
+
+
+@app.post("/voicepuck/sync-ticket")
+@require_auth
+def voicepuck_sync_ticket():
+    if not feature_enabled("voicepuck", True):
+        return jsonify({"error": "voicepuck_disabled"}), 403
+    claims = request.user_claims
+    owner_oid = claims.get("oid")
+    salesforce_username = claims.get("preferred_username")
+    body = request.get_json(silent=True) or {}
+    try:
+        if not owner_oid or not salesforce_username:
+            raise ValueError("Authenticated user identity is incomplete.")
+        device_id = safe_device_id(body.get("device_id"))
+        session_id = safe_session_id(body.get("session_id"))
+        with session_db() as conn:
+            existing = conn.execute("SELECT owner_oid, source FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if existing:
+            if existing["owner_oid"] != owner_oid:
+                return jsonify({"error": "session_id_conflict"}), 409
+            # Recovery path: the Puck may have uploaded successfully, persisted
+            # server_ack.txt, then lost the BLE phone connection before the final
+            # delete ACK. Never create/re-upload a duplicate Session. Return the
+            # previously verified server ACK only when owner + device + stored
+            # audio + completed ticket all match.
+            recovered = recover_completed_voicepuck_sync(owner_oid, device_id, session_id)
+            audit_log(
+                "voicepuck_ack_recovered", owner_oid, salesforce_username, None,
+                "Recovered completed VoicePuck server ACK after reconnect",
+                {"device_id": device_id, "session_id": session_id, "server_ack_id": recovered.get("server_ack_id")},
+            )
+            return jsonify({
+                "status": "already_completed",
+                "session_id": session_id,
+                "device_id": device_id,
+                "server_ack_id": recovered.get("server_ack_id"),
+                "sync": recovered,
+            }), 200
+
+        recording_location = body.get("recording_location") if isinstance(body.get("recording_location"), dict) else None
+        ticket_id = secrets.token_urlsafe(12)
+        ticket_secret = secrets.token_urlsafe(24)
+        now = datetime.now(timezone.utc)
+        expires = datetime.fromtimestamp(now.timestamp() + VOICEPUCK_TICKET_TTL_SECONDS, tz=timezone.utc)
+        with session_db() as conn:
+            conn.execute("UPDATE voicepuck_sync_tickets SET state='revoked', updated_at=? WHERE owner_oid=? AND session_id=? AND state NOT IN ('completed','revoked')", (utc_now_iso(), owner_oid, session_id))
+            conn.execute(
+                """INSERT INTO voicepuck_sync_tickets
+                (ticket_id,secret_hash,owner_oid,salesforce_username,device_id,session_id,state,manifest_json,received_json,recording_location_json,server_ack_id,created_at,expires_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,NULL,'[]',?,NULL,?,?,?)""",
+                (ticket_id, _voicepuck_secret_hash(ticket_secret), owner_oid, salesforce_username, device_id, session_id,
+                 "issued", json.dumps(recording_location) if recording_location else None, now.isoformat(), expires.isoformat(), now.isoformat()),
+            )
+            conn.commit()
+        audit_log("voicepuck_ticket_issued", owner_oid, salesforce_username, None, "VoicePuck sync ticket issued", {"ticket_id": ticket_id, "device_id": device_id, "session_id": session_id})
+        return jsonify({
+            "ticket_id": ticket_id,
+            "ticket_secret": ticket_secret,
+            "session_id": session_id,
+            "device_id": device_id,
+            "expires_at": expires.isoformat(),
+            "upload_base_url": f"{request.url_root.rstrip('/')}/voicepuck/upload/{ticket_id}",
+        }), 201
+    except Exception as exc:
+        return jsonify({"error": "voicepuck_ticket_failed", "details": str(exc)}), 400
+
+
+@app.post("/voicepuck/upload/<ticket_id>/manifest")
+def voicepuck_upload_manifest(ticket_id):
+    try:
+        row = verify_voicepuck_ticket(ticket_id, _voicepuck_device_secret())
+        manifest = _voicepuck_manifest_validate(request.get_json(silent=True) or {}, row["session_id"], row["device_id"])
+        staging = _voicepuck_staging_dir(row)
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        with session_db() as conn:
+            conn.execute("UPDATE voicepuck_sync_tickets SET state='uploading', manifest_json=?, received_json='[]', updated_at=? WHERE ticket_id=?", (json.dumps(manifest), utc_now_iso(), ticket_id))
+            conn.commit()
+        return jsonify({"status": "manifest_accepted", "session_id": row["session_id"], "chunks": len(manifest["chunks"])}), 202
+    except PermissionError as exc:
+        return jsonify({"error": "voicepuck_unauthorized", "details": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"error": "voicepuck_manifest_failed", "details": str(exc)}), 400
+
+
+@app.put("/voicepuck/upload/<ticket_id>/chunk/<int:chunk_index>")
+def voicepuck_upload_chunk(ticket_id, chunk_index):
+    try:
+        row = verify_voicepuck_ticket(ticket_id, _voicepuck_device_secret())
+        manifest = json.loads(row["manifest_json"] or "null")
+        if not manifest:
+            raise ValueError("Upload the VoicePuck manifest before chunks.")
+        chunks = {int(c["index"]): c for c in manifest.get("chunks") or []}
+        expected = chunks.get(int(chunk_index))
+        if not expected:
+            raise ValueError("Chunk is not present in the accepted VoicePuck manifest.")
+        content_length = request.content_length
+        if content_length is not None and int(content_length) != int(expected["bytes"]):
+            raise ValueError("VoicePuck chunk Content-Length does not match the manifest.")
+        if int(expected["bytes"]) > VOICEPUCK_MAX_CHUNK_BYTES:
+            raise ValueError("VoicePuck chunk exceeds server limit.")
+        data = request.get_data(cache=False)
+        if len(data) != int(expected["bytes"]):
+            raise ValueError("VoicePuck chunk byte count does not match the manifest.")
+        digest = hashlib.sha256(data).hexdigest()
+        if not hmac.compare_digest(digest, str(expected["sha256"])):
+            raise ValueError("VoicePuck chunk SHA-256 verification failed.")
+        staging = _voicepuck_staging_dir(row)
+        staging.mkdir(parents=True, exist_ok=True)
+        path = staging / f"chunk_{int(chunk_index):03d}.wav"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        received = set(json.loads(row["received_json"] or "[]") or [])
+        received.add(int(chunk_index))
+        received_list = sorted(received)
+        with session_db() as conn:
+            conn.execute("UPDATE voicepuck_sync_tickets SET state='uploading', received_json=?, updated_at=? WHERE ticket_id=?", (json.dumps(received_list), utc_now_iso(), ticket_id))
+            conn.commit()
+        return jsonify({"status": "chunk_verified", "index": int(chunk_index), "sha256": digest, "received_chunks": len(received_list), "total_chunks": len(chunks)}), 200
+    except PermissionError as exc:
+        return jsonify({"error": "voicepuck_unauthorized", "details": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"error": "voicepuck_chunk_failed", "details": str(exc)}), 400
+
+
+@app.post("/voicepuck/upload/<ticket_id>/complete")
+def voicepuck_upload_complete(ticket_id):
+    try:
+        row = verify_voicepuck_ticket(ticket_id, _voicepuck_device_secret(), allow_completed=True)
+        if row["state"] == "completed" and row["server_ack_id"]:
+            return jsonify({"status": "already_completed", "session_id": row["session_id"], "server_ack_id": row["server_ack_id"]}), 200
+        manifest = json.loads(row["manifest_json"] or "null")
+        if not manifest:
+            raise ValueError("VoicePuck manifest is missing.")
+        required = {int(c["index"]) for c in manifest.get("chunks") or []}
+        received = {int(i) for i in (json.loads(row["received_json"] or "[]") or [])}
+        missing = sorted(required - received)
+        if missing:
+            return jsonify({"error": "voicepuck_chunks_missing", "missing_indices": missing}), 409
+
+        final_path, measured_duration_ms = _stitch_voicepuck_wavs(row, manifest)
+        recording_location = json.loads(row["recording_location_json"] or "null")
+        metadata = {
+            "session_id": row["session_id"],
+            "source": "voicepuck",
+            "started_at": manifest.get("started_at"),
+            "ended_at": manifest.get("ended_at"),
+            "duration_ms": int(manifest.get("duration_ms") or measured_duration_ms),
+            "voicepuck": {
+                "assigned": True,
+                "connected": False,
+                "device_id": row["device_id"],
+                "firmware_version": manifest.get("firmware_version"),
+                "sync_transport": "wifi_https",
+            },
+        }
+        claims = {"oid": row["owner_oid"]}
+        insert_or_replace_uploaded_session(
+            row["session_id"], claims, row["salesforce_username"], metadata,
+            final_path, final_path.stat().st_size, recording_location, recording_location,
+        )
+        ack_id = secrets.token_urlsafe(12)
+        with session_db() as conn:
+            conn.execute("UPDATE voicepuck_sync_tickets SET state='completed', server_ack_id=?, updated_at=? WHERE ticket_id=?", (ack_id, utc_now_iso(), ticket_id))
+            conn.commit()
+        launch_session_processing(row["session_id"], row["owner_oid"], row["salesforce_username"])
+        audit_log("voicepuck_sync_completed", row["owner_oid"], row["salesforce_username"], None, "VoicePuck Session verified and stored", {"ticket_id": ticket_id, "device_id": row["device_id"], "session_id": row["session_id"], "server_ack_id": ack_id, "audio_bytes": final_path.stat().st_size})
+        return jsonify({"status": "completed", "session_id": row["session_id"], "server_ack_id": ack_id, "audio_bytes": final_path.stat().st_size}), 201
+    except PermissionError as exc:
+        return jsonify({"error": "voicepuck_unauthorized", "details": str(exc)}), 401
+    except Exception as exc:
+        return jsonify({"error": "voicepuck_complete_failed", "details": str(exc)}), 400
+
+
+@app.get("/voicepuck/sync-status/<session_id>")
+@require_auth
+def voicepuck_sync_status(session_id):
+    owner_oid = request.user_claims.get("oid")
+    try:
+        sid = safe_session_id(session_id)
+        with session_db() as conn:
+            row = conn.execute("SELECT * FROM voicepuck_sync_tickets WHERE owner_oid=? AND session_id=? ORDER BY created_at DESC LIMIT 1", (owner_oid, sid)).fetchone()
+        if not row:
+            return jsonify({"error": "voicepuck_sync_not_found"}), 404
+        return jsonify({"sync": voicepuck_ticket_public(row)})
+    except Exception as exc:
+        return jsonify({"error": "voicepuck_status_failed", "details": str(exc)}), 400
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 
@@ -4785,6 +5211,8 @@ def health():
         "session_storage_root": str(SESSION_STORAGE_ROOT),
         "persistent_disk_expected": str(SESSION_STORAGE_ROOT).startswith("/var/data"),
         "demo_geo_enabled": feature_enabled("demo_geography", DEMO_GEO_ENABLED),
+        "voicepuck_enabled": feature_enabled("voicepuck", True),
+        "voicepuck_mode": "v4.2a_ble_wifi_https",
     })
 
 
@@ -5142,7 +5570,7 @@ def list_sessions():
         ).fetchall()
     return jsonify({
         "sessions": [session_row_to_dict(row, include_summary=False) for row in rows],
-        "voicepuck": {"assigned": False, "connected": False, "device_id": None},
+        "voicepuck": {"supported": feature_enabled("voicepuck", True), "mode": "v4.2a_ble_wifi_https", "live_connection": "phone_local"},
         "storage_root": str(SESSION_STORAGE_ROOT),
     })
 
@@ -5249,7 +5677,7 @@ def get_session_audio(session_id):
         path = row["audio_path"]
         if not path or not Path(path).exists():
             return jsonify({"error": "audio_not_found"}), 404
-        return send_file(path, mimetype="audio/mp4", conditional=True)
+        return send_file(path, mimetype=("audio/wav" if str(path).lower().endswith(".wav") else "audio/mp4"), conditional=True)
     except Exception as exc:
         return jsonify({"error": "audio_failed", "details": str(exc)}), 404
 
@@ -5549,7 +5977,7 @@ def admin_overview():
         "web_searches_today": web_today, "sessions_ready_today": sessions_ready_today, "errors_today": errors_today,
         "users": [dict(r) for r in users], "event_counts": [dict(r) for r in event_counts], "jobs": jobs[:25],
         "models": {"orchestrator": "gpt-5.6-luna / low", "analysis": "gpt-5.6-terra", "deep": "gpt-5.6-sol", "transcription": "gpt-4o-transcribe-diarize"},
-        "voicepuck": {"mode": "demo", "assigned": False, "connected": False},
+        "voicepuck": {"mode": "v4.2a_ble_wifi_https", "supported": feature_enabled("voicepuck", True), "connection_truth": "BLE connection state lives on the phone; server reports sync jobs only"},
     })
 
 
@@ -5609,7 +6037,7 @@ def admin_retry_session(session_id):
 def admin_session_audio(session_id):
     row = _session_row_any(session_id)
     if not row or not row["audio_path"] or not Path(row["audio_path"]).exists(): abort(404)
-    return send_file(row["audio_path"], mimetype="audio/mp4", conditional=True)
+    return send_file(row["audio_path"], mimetype=("audio/wav" if str(row["audio_path"]).lower().endswith(".wav") else "audio/mp4"), conditional=True)
 
 
 @app.get("/admin/sessions/<session_id>/transcript")
