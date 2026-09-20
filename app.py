@@ -13,7 +13,7 @@ import shutil
 import hmac
 import secrets
 from pathlib import Path
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from functools import wraps
 from typing import Literal, Optional
 
@@ -677,9 +677,13 @@ def session_row_to_dict(row, include_summary=True):
         "connected": False,
         "device_id": None,
     }
+    linked_context = json.loads(data.get("linked_context_json") or "null")
+    suggested_context = json.loads(data.get("suggested_context_json") or "null")
 
     result = {
         "session_id": data.get("session_id"),
+        "principal_id": data.get("principal_id"),
+        "domain": data.get("domain") or "sales",
         "title": data.get("title") or "Untitled session",
         "status": data.get("status"),
         "source": data.get("source"),
@@ -693,6 +697,8 @@ def session_row_to_dict(row, include_summary=True):
         "effective_location": effective_location,
         "voicepuck": voicepuck,
         "processing_error": data.get("processing_error"),
+        "linked_context": linked_context,
+        "suggested_context": suggested_context,
         "linked_opportunity": (
             {
                 "id": data.get("linked_opportunity_id"),
