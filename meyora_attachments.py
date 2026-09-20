@@ -421,7 +421,7 @@ class AttachmentStore:
                 extracted_path_value = str(text_path)
             else:
                 extracted_path_value = None
-            status = "ready" if extracted or extension in IMAGE_EXTENSIONS else "ready_with_warning"
+            status = "ready" if extracted else "ready_with_warning"
             error = metadata.get("warning") if isinstance(metadata, dict) else None
             with self.db_factory() as conn:
                 conn.execute(
