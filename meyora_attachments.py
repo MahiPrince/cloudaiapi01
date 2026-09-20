@@ -231,7 +231,8 @@ def _image_description(path: Path, openai_client) -> tuple[str, dict[str, Any]]:
 
 
 def _validate_package(path: Path, extension: str) -> None:
-    header = path.read_bytes()[:16]
+    with path.open("rb") as source:
+        header = source.read(16)
     if extension == ".pdf":
         if not header.startswith(b"%PDF-"):
             raise ValueError("The uploaded file does not have a valid PDF signature.")
