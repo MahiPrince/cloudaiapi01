@@ -4805,6 +4805,7 @@ Rules:
 def process_session(session_id, owner_oid, salesforce_username):
     try:
         row = owner_session_row(session_id, owner_oid)
+        domain = str(row["domain"] or "sales")
         audio_path = row["audio_path"]
         if not audio_path or not Path(audio_path).exists():
             raise RuntimeError("Session audio file is missing.")
@@ -4833,21 +4834,87 @@ def process_session(session_id, owner_oid, salesforce_username):
             )
             conn.commit()
 
-        sf = get_salesforce_access_token(salesforce_username)
-        candidates = open_opportunity_candidates(sf, salesforce_username)
-        intelligence = analyze_session_transcript(transcript_payload, candidates)
+        linked_context = None
+        suggested_context = None
+        linked_opportunity_id = None
+        linked_opportunity_name = None
+        linked_opportunity_confidence = None
+        suggested_opportunity_id = None
+        suggested_opportunity_name = None
+        suggested_opportunity_confidence = None
 
-        candidate_by_id = {c["id"]: c for c in candidates if c.get("id")}
-        proposed_id = intelligence.get("linked_opportunity_id")
-        confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
-        if proposed_id not in candidate_by_id:
-            proposed_id = None
-            confidence = 0.0
+        if domain == "field_service":
+            candidates = field_work_order_candidates(row)
+            intelligence = analyze_field_session_transcript(transcript_payload, candidates)
+            candidate_by_id = {item["id"]: item for item in candidates if item.get("id")}
+            proposed_id = intelligence.get("linked_work_order_id")
+            confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+            if proposed_id not in candidate_by_id:
+                proposed_id = None
+                confidence = 0.0
 
-        linked_id = proposed_id if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD else None
-        linked_name = candidate_by_id.get(linked_id, {}).get("name") if linked_id else None
-        suggested_id = proposed_id if proposed_id and not linked_id else None
-        suggested_name = candidate_by_id.get(suggested_id, {}).get("name") if suggested_id else None
+            if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD:
+                candidate = candidate_by_id[proposed_id]
+                linked_context = {
+                    "type": "work_order",
+                    "id": proposed_id,
+                    "label": candidate.get("label"),
+                    "account": candidate.get("account"),
+                    "asset": candidate.get("asset"),
+                    "scheduled_start": candidate.get("scheduled_start"),
+                    "confidence": confidence,
+                }
+            elif proposed_id:
+                candidate = candidate_by_id[proposed_id]
+                suggested_context = {
+                    "type": "work_order",
+                    "id": proposed_id,
+                    "label": candidate.get("label"),
+                    "account": candidate.get("account"),
+                    "asset": candidate.get("asset"),
+                    "scheduled_start": candidate.get("scheduled_start"),
+                    "confidence": confidence,
+                    "reason": intelligence.get("link_reason"),
+                }
+            default_title = "Field Service session"
+        else:
+            sf = get_salesforce_access_token(salesforce_username)
+            candidates = open_opportunity_candidates(sf, salesforce_username)
+            intelligence = analyze_session_transcript(transcript_payload, candidates)
+
+            candidate_by_id = {item["id"]: item for item in candidates if item.get("id")}
+            proposed_id = intelligence.get("linked_opportunity_id")
+            confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+            if proposed_id not in candidate_by_id:
+                proposed_id = None
+                confidence = 0.0
+
+            if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD:
+                candidate = candidate_by_id[proposed_id]
+                linked_opportunity_id = proposed_id
+                linked_opportunity_name = candidate.get("name")
+                linked_opportunity_confidence = confidence
+                linked_context = {
+                    "type": "opportunity",
+                    "id": proposed_id,
+                    "label": candidate.get("name"),
+                    "account": candidate.get("account"),
+                    "confidence": confidence,
+                }
+            elif proposed_id:
+                candidate = candidate_by_id[proposed_id]
+                suggested_opportunity_id = proposed_id
+                suggested_opportunity_name = candidate.get("name")
+                suggested_opportunity_confidence = confidence
+                suggested_context = {
+                    "type": "opportunity",
+                    "id": proposed_id,
+                    "label": candidate.get("name"),
+                    "account": candidate.get("account"),
+                    "confidence": confidence,
+                    "reason": intelligence.get("link_reason"),
+                }
+            default_title = "Sales session"
 
         summary_json_path = session_dir / "summary.json"
         summary_json_path.write_text(json.dumps(intelligence, indent=2), encoding="utf-8")
@@ -4856,28 +4923,45 @@ def process_session(session_id, owner_oid, salesforce_username):
             conn.execute(
                 """
                 UPDATE sessions
-                SET status=?, title=?, summary_json_path=?, linked_opportunity_id=?, linked_opportunity_name=?,
-                    link_confidence=?, suggested_opportunity_id=?, suggested_opportunity_name=?, suggested_confidence=?,
-                    link_reason=?, processing_error=NULL, updated_at=?
+                SET status=?, title=?, summary_json_path=?,
+                    linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
+                    suggested_opportunity_id=?, suggested_opportunity_name=?, suggested_confidence=?,
+                    linked_context_json=?, suggested_context_json=?, link_reason=?,
+                    processing_error=NULL, updated_at=?
                 WHERE session_id=?
                 """,
                 (
                     "ready",
-                    (intelligence.get("title") or "Sales session")[:240],
+                    (intelligence.get("title") or default_title)[:240],
                     str(summary_json_path),
-                    linked_id,
-                    linked_name,
-                    confidence if linked_id else None,
-                    suggested_id,
-                    suggested_name,
-                    confidence if suggested_id else None,
+                    linked_opportunity_id,
+                    linked_opportunity_name,
+                    linked_opportunity_confidence,
+                    suggested_opportunity_id,
+                    suggested_opportunity_name,
+                    suggested_opportunity_confidence,
+                    json.dumps(linked_context, default=str) if linked_context else None,
+                    json.dumps(suggested_context, default=str) if suggested_context else None,
                     str(intelligence.get("link_reason") or "")[:2000],
                     utc_now_iso(),
                     session_id,
                 ),
             )
             conn.commit()
-        audit_log("session_ready", owner_oid, salesforce_username, None, "Session processing completed", {"session_id": session_id, "linked_opportunity_id": linked_id})
+
+        audit_log(
+            "session_ready",
+            owner_oid,
+            salesforce_username,
+            None,
+            "Session processing completed",
+            {
+                "session_id": session_id,
+                "domain": domain,
+                "linked_context": linked_context,
+                "suggested_context": suggested_context,
+            },
+        )
 
     except Exception as exc:
         try:
@@ -4889,8 +4973,14 @@ def process_session(session_id, owner_oid, salesforce_username):
                 conn.commit()
         except Exception:
             pass
-        audit_log("session_error", owner_oid, salesforce_username, None, "Session processing failed", {"session_id": session_id, "error": str(exc)[:2000]})
-
+        audit_log(
+            "session_error",
+            owner_oid,
+            salesforce_username,
+            None,
+            "Session processing failed",
+            {"session_id": session_id, "error": str(exc)[:2000]},
+        )
 
 SESSION_PROCESSING_IDS = set()
 SESSION_PROCESSING_LOCK = threading.Lock()
