@@ -6172,6 +6172,37 @@ def admin_salesforce_test():
 
 
 # ============================================================
+# MEYORA CORE — UNIVERSAL ROUTER / CAPABILITY / ADMIN LAYER
+# ============================================================
+
+from meyora_core import register_meyora_core
+
+register_meyora_core(app, {
+    "session_db": session_db,
+    "require_auth": require_auth,
+    "admin_api_required": admin_api_required,
+    "admin_mutation_required": admin_mutation_required,
+    "openai_client": openai_client,
+    "normalize_conversation_history": normalize_conversation_history,
+    "normalize_client_context": normalize_client_context,
+    "client_time_prompt": client_time_prompt,
+    "CRM_READ_TOOLS": CRM_READ_TOOLS,
+    "CRM_WRITE_TOOLS": CRM_WRITE_TOOLS,
+    "APP_SIGNING_SECRET": APP_SIGNING_SECRET,
+    "get_salesforce_access_token": get_salesforce_access_token,
+    "run_function_tool": run_function_tool,
+    "feature_enabled": feature_enabled,
+    "resolve_location_context": resolve_location_context,
+    "ui_block_from_tool_result": ui_block_from_tool_result,
+    "build_conversation_text": build_conversation_text,
+    "collect_web_metadata": collect_web_metadata,
+    "parse_agent_presentation": parse_agent_presentation,
+    "create_confirmation_token": create_confirmation_token,
+    "decode_confirmation_token": decode_confirmation_token,
+    "execute_confirmed_actions": execute_confirmed_actions,
+})
+
+# ============================================================
 # LOCAL DEV
 # ============================================================
 
