@@ -248,6 +248,14 @@ Use the same routing logic for every domain. Identity only changes available cap
                         for item in (res.get("items") or [])[:10]: blocks.append({"type":"service_appointment","source":"C4C","work_order":item.get("work_order"),"account":item.get("account"),"site":item.get("site"),"asset":item.get("asset")})
                     elif call.name=="work_context" and isinstance(res,dict) and res.get("ok"):
                         x=res.get("context") or {}; blocks.append({"type":"work_order","source":"C4C","work_order":x.get("work_order"),"account":x.get("account"),"site":x.get("site"),"asset":x.get("asset")})
+                    elif call.name=="calendar_search" and isinstance(res,dict) and res.get("ok"):
+                        blocks.append({"type":"calendar_list","source":"Outlook Calendar","items":(res.get("items") or [])[:12]})
+                    elif call.name=="mail_search" and isinstance(res,dict) and res.get("ok"):
+                        blocks.append({"type":"mail_list","source":"Outlook","items":(res.get("items") or [])[:10]})
+                    elif call.name=="teams_search" and isinstance(res,dict) and res.get("ok"):
+                        blocks.append({"type":"teams_list","source":"Microsoft Teams","items":(res.get("items") or [])[:10]})
+                    elif call.name=="inventory_search" and isinstance(res,dict) and res.get("ok"):
+                        blocks.append({"type":"inventory_list","source":"C4C Inventory","items":(res.get("items") or [])[:12]})
                     inp.append({"type":"function_call_output","call_id":call.call_id,"output":_j(res,20000)})
             raise RuntimeError("tool_loop_exceeded")
         except Exception as exc:
