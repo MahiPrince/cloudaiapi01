@@ -306,7 +306,15 @@ Use the same routing logic for every domain. Identity only changes available cap
         with db() as c:
             users=[dict(r) for r in c.execute("SELECT p.*,(SELECT count(*) FROM meyora_principal_capabilities pc WHERE pc.principal_id=p.principal_id AND pc.enabled=1) capability_count FROM meyora_principals p ORDER BY p.display_name").fetchall()]
             cnt=c.execute("SELECT count(*) total,sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,sum(CASE WHEN domain='sales' THEN 1 ELSE 0 END) sales,sum(CASE WHEN domain='field_service' THEN 1 ELSE 0 END) field_service FROM meyora_requests").fetchone()
-            connectors=[{"id":"salesforce","domain":"sales","mode":"real","status":"connected"},{"id":"c4c","domain":"field_service","mode":"mock","status":"connected"},{"id":"outlook","domain":"field_service","mode":"mock","status":"connected"},{"id":"teams","domain":"field_service","mode":"mock","status":"connected"},{"id":"outlook_calendar","domain":"field_service","mode":"mock","status":"connected"}]
+            connectors=[
+                {"id":"salesforce","domain":"sales","mode":"real","status":"connected"},
+                {"id":"web","domain":"shared","mode":"real","status":"connected"},
+                {"id":"c4c","domain":"field_service","mode":"mock","status":"connected"},
+                {"id":"c4c_inventory","domain":"field_service","mode":"mock","status":"connected"},
+                {"id":"outlook","domain":"field_service","mode":"mock","status":"connected"},
+                {"id":"teams","domain":"field_service","mode":"mock","status":"connected"},
+                {"id":"outlook_calendar","domain":"field_service","mode":"mock","status":"connected"},
+            ]
         return jsonify({"version":CORE_VERSION,"principals":users,"counts":dict(cnt) if cnt else {},"connectors":connectors})
 
     @app.get("/admin/api/meyora/requests")
