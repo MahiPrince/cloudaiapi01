@@ -22,5 +22,7 @@ jobs:
         run: python -m py_compile app.py meyora_core.py meyora_attachments.py
       - name: Attachment ingestion tests
         run: python tests/test_meyora_attachments.py
+      - name: Session domain schema tests
+        run: python tests/test_v46_session_schema.py
       - name: Admin JavaScript syntax
         run: node --check static/admin.js
