@@ -4805,6 +4805,18 @@ Rules:
 def process_session(session_id, owner_oid, salesforce_username):
     try:
         row = owner_session_row(session_id, owner_oid)
+        if not row["domain"]:
+            inferred = session_principal_from_claims({
+                "oid": row["owner_oid"],
+                "preferred_username": row["salesforce_username"],
+            })
+            with session_db() as conn:
+                conn.execute(
+                    "UPDATE sessions SET principal_id=?,domain=?,updated_at=? WHERE session_id=? AND owner_oid=?",
+                    (inferred.get("principal_id"), inferred.get("domain") or "sales", utc_now_iso(), session_id, owner_oid),
+                )
+                conn.commit()
+            row = owner_session_row(session_id, owner_oid)
         domain = str(row["domain"] or "sales")
         audio_path = row["audio_path"]
         if not audio_path or not Path(audio_path).exists():
