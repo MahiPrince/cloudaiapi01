@@ -20,5 +20,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Python syntax
         run: python -m py_compile app.py meyora_core.py meyora_attachments.py
+      - name: Attachment ingestion tests
+        run: python tests/test_meyora_attachments.py
       - name: Admin JavaScript syntax
         run: node --check static/admin.js
