@@ -5879,6 +5879,7 @@ def upload_session():
     claims = request.user_claims
     owner_oid = claims.get("oid")
     salesforce_username = claims.get("preferred_username")
+    principal = session_principal_from_claims(claims)
     if not owner_oid or not salesforce_username:
         return jsonify({"error": "identity_missing"}), 400
 
@@ -5902,9 +5903,11 @@ def upload_session():
             "geo_session_id": metadata.get("geo_session_id") or session_id,
         } if raw_location else {}
         location_context = None
-        if raw_location:
+        if raw_location and principal.get("domain") == "sales":
             sf = get_salesforce_access_token(salesforce_username)
             location_context = resolve_location_context(sf, salesforce_username, client_context, claims)
+        elif raw_location:
+            location_context = {"actual": raw_location, "effective": raw_location, "mode": "device_location"}
 
         insert_or_replace_uploaded_session(
             session_id,
@@ -5915,6 +5918,7 @@ def upload_session():
             audio_bytes,
             (location_context or {}).get("actual") if location_context else raw_location,
             (location_context or {}).get("effective") if location_context else raw_location,
+            principal=principal,
         )
         launch_session_processing(session_id, owner_oid, salesforce_username)
         row = owner_session_row(session_id, owner_oid)
