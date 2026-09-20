@@ -167,6 +167,7 @@ def init_session_db():
             )
             """
         )
+        _ensure_column(conn, "sessions", "domain", "TEXT")
         _ensure_column(conn, "sessions", "deleted_at", "TEXT")
         _ensure_column(conn, "sessions", "deleted_by", "TEXT")
         _ensure_column(conn, "sessions", "deleted_archive_path", "TEXT")
@@ -613,6 +614,7 @@ def session_row_to_dict(row, include_summary=True):
 
     result = {
         "session_id": data.get("session_id"),
+        "domain": data.get("domain") or "sales",
         "title": data.get("title") or "Untitled session",
         "status": data.get("status"),
         "source": data.get("source"),
@@ -651,6 +653,38 @@ def session_row_to_dict(row, include_summary=True):
     if include_summary:
         result["summary"] = summary or None
     return result
+
+
+def session_domain_for_claims(claims):
+    """Resolve Session behavior from the server-side Meyora principal registry.
+
+    Never trust a caller-provided domain to decide whether Salesforce is touched.
+    Existing/unknown users stay on the historical Sales path for backwards compatibility.
+    """
+    claims = claims or {}
+    oid = str(claims.get("oid") or "").strip()
+    upn = str(claims.get("preferred_username") or claims.get("upn") or "").strip().lower()
+    try:
+        with session_db() as conn:
+            row = None
+            if oid:
+                row = conn.execute(
+                    "SELECT domain FROM meyora_principals WHERE entra_oid=? AND enabled=1",
+                    (oid,),
+                ).fetchone()
+            if row is None and upn:
+                row = conn.execute(
+                    "SELECT domain FROM meyora_principals WHERE lower(entra_upn)=? AND enabled=1",
+                    (upn,),
+                ).fetchone()
+        domain = str(row["domain"] or "").strip().lower() if row else ""
+        if domain in {"sales", "field_service"}:
+            return domain
+    except Exception:
+        # Meyora Core may not have initialized its registry yet during an early boot.
+        # Falling back to Sales preserves the pre-existing behavior without granting access.
+        pass
+    return "sales"
 
 
 # ============================================================
@@ -4602,12 +4636,55 @@ Rules:
     return parsed.model_dump()
 
 
+def analyze_generic_session_transcript(transcript_payload, domain):
+    segment_text = format_transcript_text(transcript_payload)
+    if len(segment_text) > 140000:
+        segment_text = segment_text[:140000]
+
+    domain_label = "Field Service" if domain == "field_service" else str(domain or "Work").replace("_", " ").title()
+    instructions = f"""
+You are Meyora's post-session intelligence engine for the {domain_label} domain.
+Analyze the speaker-labelled work conversation and produce useful, factual session intelligence.
+
+Rules:
+- Do not assume Salesforce, sales stages, opportunities, pipeline, or CRM records exist.
+- linked_opportunity_id must always be null and link_confidence must be 0.
+- Use customer_needs for explicit customer/site needs.
+- Use products_discussed for instruments, products, parts, software, or services discussed.
+- Use rep_commitments for commitments made by the authenticated Meyora user.
+- Use customer_commitments for commitments made by customer/site participants.
+- Keep follow-ups concrete and short.
+- Do not perform any external-system writes.
+- Do not invent facts that are not present in the transcript.
+"""
+    response = openai_client.responses.parse(
+        model="gpt-5.6-terra",
+        reasoning={"effort": "medium"},
+        store=False,
+        input=[
+            {"role": "developer", "content": instructions},
+            {"role": "user", "content": "DIARIZED TRANSCRIPT:\n" + segment_text},
+        ],
+        text_format=SessionIntelligence,
+    )
+    parsed = response.output_parsed
+    if parsed is None:
+        raise RuntimeError("Session intelligence model returned no structured result.")
+    result = parsed.model_dump()
+    result["linked_opportunity_id"] = None
+    result["link_confidence"] = 0.0
+    result["link_reason"] = ""
+    return result
+
+
 def process_session(session_id, owner_oid, salesforce_username):
     try:
         row = owner_session_row(session_id, owner_oid)
         audio_path = row["audio_path"]
         if not audio_path or not Path(audio_path).exists():
             raise RuntimeError("Session audio file is missing.")
+
+        domain = str(row["domain"] or "sales").strip().lower()
 
         with session_db() as conn:
             conn.execute(
@@ -4633,21 +4710,32 @@ def process_session(session_id, owner_oid, salesforce_username):
             )
             conn.commit()
 
-        sf = get_salesforce_access_token(salesforce_username)
-        candidates = open_opportunity_candidates(sf, salesforce_username)
-        intelligence = analyze_session_transcript(transcript_payload, candidates)
+        linked_id = None
+        linked_name = None
+        suggested_id = None
+        suggested_name = None
+        confidence = 0.0
 
-        candidate_by_id = {c["id"]: c for c in candidates if c.get("id")}
-        proposed_id = intelligence.get("linked_opportunity_id")
-        confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
-        if proposed_id not in candidate_by_id:
-            proposed_id = None
-            confidence = 0.0
+        if domain == "sales":
+            sf = get_salesforce_access_token(salesforce_username)
+            candidates = open_opportunity_candidates(sf, salesforce_username)
+            intelligence = analyze_session_transcript(transcript_payload, candidates)
 
-        linked_id = proposed_id if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD else None
-        linked_name = candidate_by_id.get(linked_id, {}).get("name") if linked_id else None
-        suggested_id = proposed_id if proposed_id and not linked_id else None
-        suggested_name = candidate_by_id.get(suggested_id, {}).get("name") if suggested_id else None
+            candidate_by_id = {c["id"]: c for c in candidates if c.get("id")}
+            proposed_id = intelligence.get("linked_opportunity_id")
+            confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+            if proposed_id not in candidate_by_id:
+                proposed_id = None
+                confidence = 0.0
+
+            linked_id = proposed_id if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD else None
+            linked_name = candidate_by_id.get(linked_id, {}).get("name") if linked_id else None
+            suggested_id = proposed_id if proposed_id and not linked_id else None
+            suggested_name = candidate_by_id.get(suggested_id, {}).get("name") if suggested_id else None
+            default_title = "Sales session"
+        else:
+            intelligence = analyze_generic_session_transcript(transcript_payload, domain)
+            default_title = "Field service session" if domain == "field_service" else "Work session"
 
         summary_json_path = session_dir / "summary.json"
         summary_json_path.write_text(json.dumps(intelligence, indent=2), encoding="utf-8")
@@ -4663,7 +4751,7 @@ def process_session(session_id, owner_oid, salesforce_username):
                 """,
                 (
                     "ready",
-                    (intelligence.get("title") or "Sales session")[:240],
+                    (intelligence.get("title") or default_title)[:240],
                     str(summary_json_path),
                     linked_id,
                     linked_name,
@@ -4677,7 +4765,14 @@ def process_session(session_id, owner_oid, salesforce_username):
                 ),
             )
             conn.commit()
-        audit_log("session_ready", owner_oid, salesforce_username, None, "Session processing completed", {"session_id": session_id, "linked_opportunity_id": linked_id})
+        audit_log(
+            "session_ready",
+            owner_oid,
+            salesforce_username,
+            None,
+            "Session processing completed",
+            {"session_id": session_id, "domain": domain, "linked_opportunity_id": linked_id},
+        )
 
     except Exception as exc:
         try:
@@ -4740,14 +4835,15 @@ def insert_or_replace_uploaded_session(
         conn.execute(
             """
             INSERT INTO sessions (
-                session_id, owner_oid, salesforce_username, title, status, source,
+                session_id, owner_oid, salesforce_username, domain, title, status, source,
                 started_at, ended_at, duration_ms, audio_path, audio_bytes,
                 actual_location_json, effective_location_json, voicepuck_json,
                 processing_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 owner_oid=excluded.owner_oid,
                 salesforce_username=excluded.salesforce_username,
+                domain=excluded.domain,
                 status=excluded.status,
                 source=excluded.source,
                 started_at=excluded.started_at,
@@ -4765,6 +4861,7 @@ def insert_or_replace_uploaded_session(
                 session_id,
                 claims.get("oid"),
                 salesforce_username,
+                session_domain_for_claims(claims),
                 metadata.get("title") or "Processing session",
                 "uploaded",
                 metadata.get("source") or "iphone",
@@ -5605,10 +5702,17 @@ def upload_session():
             "location": raw_location,
             "geo_session_id": metadata.get("geo_session_id") or session_id,
         } if raw_location else {}
+        session_domain = session_domain_for_claims(claims)
         location_context = None
-        if raw_location:
+        if raw_location and session_domain == "sales":
             sf = get_salesforce_access_token(salesforce_username)
             location_context = resolve_location_context(sf, salesforce_username, client_context, claims)
+        elif raw_location:
+            location_context = {
+                "mode": "device",
+                "actual": raw_location,
+                "effective": raw_location,
+            }
 
         insert_or_replace_uploaded_session(
             session_id,
@@ -5702,6 +5806,8 @@ def retry_session(session_id):
 @require_auth
 def session_link_options():
     claims = request.user_claims
+    if session_domain_for_claims(claims) != "sales":
+        return jsonify({"error": "opportunity_linking_not_available_for_domain"}), 403
     try:
         sf = get_salesforce_access_token(claims.get("preferred_username"))
         candidates = open_opportunity_candidates(sf, claims.get("preferred_username"))
@@ -5714,6 +5820,8 @@ def session_link_options():
 @require_auth
 def link_session_opportunity(session_id):
     claims = request.user_claims
+    if session_domain_for_claims(claims) != "sales":
+        return jsonify({"error": "opportunity_linking_not_available_for_domain"}), 403
     body = request.get_json(silent=True) or {}
     opportunity_id = body.get("opportunity_id")
     try:
