@@ -5453,10 +5453,12 @@ def voicepuck_upload_complete(ticket_id):
                 "sync_transport": "wifi_https",
             },
         }
-        claims = {"oid": row["owner_oid"]}
+        claims = {"oid": row["owner_oid"], "preferred_username": row["salesforce_username"]}
+        principal = session_principal_from_claims(claims)
         insert_or_replace_uploaded_session(
             row["session_id"], claims, row["salesforce_username"], metadata,
             final_path, final_path.stat().st_size, recording_location, recording_location,
+            principal=principal,
         )
         ack_id = secrets.token_urlsafe(12)
         with session_db() as conn:
