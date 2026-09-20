@@ -5,3 +5,6 @@ requests
 openai
 pydantic
 imageio-ffmpeg
+pypdf
+Pillow
+pillow-heif

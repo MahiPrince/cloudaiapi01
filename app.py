@@ -13,7 +13,7 @@ import shutil
 import hmac
 import secrets
 from pathlib import Path
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from functools import wraps
 from typing import Literal, Optional
 
@@ -71,6 +71,8 @@ SESSION_CHUNK_SECONDS = int(os.environ.get("SESSION_CHUNK_SECONDS", "1200"))
 VOICEPUCK_TICKET_TTL_SECONDS = max(300, min(int(os.environ.get("VOICEPUCK_TICKET_TTL_SECONDS", "1800")), 7200))
 VOICEPUCK_MAX_CHUNK_BYTES = max(1_000_000, min(int(os.environ.get("VOICEPUCK_MAX_CHUNK_BYTES", "16000000")), 32_000_000))
 VOICEPUCK_MAX_SESSION_BYTES = max(VOICEPUCK_MAX_CHUNK_BYTES, min(int(os.environ.get("VOICEPUCK_MAX_SESSION_BYTES", "1000000000")), 2_000_000_000))
+MEYORA_FIELD_ADAPTER_URL = os.environ.get("MEYORA_FIELD_ADAPTER_URL", "https://meyora-field-demo-api.onrender.com").rstrip("/")
+MEYORA_FIELD_ADAPTER_TOKEN = os.environ.get("MEYORA_FIELD_ADAPTER_TOKEN", "").strip()
 
 # Demo admin console. No default password is provided: /admin remains unavailable
 # until these values are configured in Render.
@@ -170,6 +172,10 @@ def init_session_db():
         _ensure_column(conn, "sessions", "deleted_at", "TEXT")
         _ensure_column(conn, "sessions", "deleted_by", "TEXT")
         _ensure_column(conn, "sessions", "deleted_archive_path", "TEXT")
+        _ensure_column(conn, "sessions", "principal_id", "TEXT")
+        _ensure_column(conn, "sessions", "domain", "TEXT")
+        _ensure_column(conn, "sessions", "linked_context_json", "TEXT")
+        _ensure_column(conn, "sessions", "suggested_context_json", "TEXT")
 
         conn.execute(
             """CREATE TABLE IF NOT EXISTS audit_events (
@@ -580,6 +586,67 @@ def recover_completed_voicepuck_sync(owner_oid, device_id, session_id):
     return voicepuck_ticket_public(ticket_row)
 
 
+def session_principal_from_claims(claims):
+    raw = os.environ.get("MEYORA_PRINCIPALS_JSON", "[]")
+    try:
+        items = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError("MEYORA_PRINCIPALS_JSON is invalid JSON") from exc
+    oid = str((claims or {}).get("oid") or "").strip()
+    upn = str((claims or {}).get("preferred_username") or (claims or {}).get("upn") or "").strip().lower()
+    for item in items if isinstance(items, list) else []:
+        match = item.get("match") or {}
+        match_oid = str(match.get("oid") or "").strip()
+        match_upn = str(match.get("username") or "").strip().lower()
+        if (oid and match_oid and oid == match_oid) or (upn and match_upn and upn == match_upn):
+            return {
+                "principal_id": str(item.get("principal_id") or ""),
+                "display_name": str(item.get("display_name") or item.get("principal_id") or "Meyora User"),
+                "role": str(item.get("role") or "User"),
+                "domain": str(item.get("domain") or "sales"),
+                "entra_oid": oid or match_oid or None,
+                "entra_upn": upn or match_upn or None,
+            }
+    return {
+        "principal_id": "legacy-sales",
+        "display_name": str((claims or {}).get("name") or "Meyora User"),
+        "role": "User",
+        "domain": "sales",
+        "entra_oid": oid or None,
+        "entra_upn": upn or None,
+    }
+
+
+def session_field_adapter_tool(name, arguments, session_id="session-intelligence"):
+    if not MEYORA_FIELD_ADAPTER_TOKEN:
+        raise RuntimeError("MEYORA_FIELD_ADAPTER_TOKEN is not configured.")
+    attempts = 4
+    last = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep((0, 2, 5, 9)[attempt])
+        try:
+            response = requests.post(
+                MEYORA_FIELD_ADAPTER_URL + "/adapter/tool",
+                headers={"Authorization": "Bearer " + MEYORA_FIELD_ADAPTER_TOKEN},
+                json={"name": name, "arguments": arguments or {}, "session_id": session_id},
+                timeout=75,
+            )
+            if response.status_code in {502, 503, 504} and attempt < attempts - 1:
+                last = f"HTTP {response.status_code}"
+                continue
+            try:
+                body = response.json()
+            except Exception:
+                body = {"ok": False, "error": f"non_json_adapter_{response.status_code}"}
+            if not response.ok:
+                body.setdefault("ok", False)
+            return body
+        except requests.RequestException as exc:
+            last = str(exc)
+    return {"ok": False, "error": "field_adapter_unavailable", "details": last}
+
+
 def owner_session_row(session_id, owner_oid):
     with session_db() as conn:
         row = conn.execute(
@@ -602,6 +669,13 @@ def read_json_file(path_value, default=None):
 
 def session_row_to_dict(row, include_summary=True):
     data = dict(row)
+    if not data.get("domain"):
+        inferred = session_principal_from_claims({
+            "oid": data.get("owner_oid"),
+            "preferred_username": data.get("salesforce_username"),
+        })
+        data["principal_id"] = data.get("principal_id") or inferred.get("principal_id")
+        data["domain"] = inferred.get("domain") or "sales"
     summary = read_json_file(data.get("summary_json_path"), {}) if include_summary else None
     actual_location = json.loads(data.get("actual_location_json") or "null")
     effective_location = json.loads(data.get("effective_location_json") or "null")
@@ -610,9 +684,13 @@ def session_row_to_dict(row, include_summary=True):
         "connected": False,
         "device_id": None,
     }
+    linked_context = json.loads(data.get("linked_context_json") or "null")
+    suggested_context = json.loads(data.get("suggested_context_json") or "null")
 
     result = {
         "session_id": data.get("session_id"),
+        "principal_id": data.get("principal_id"),
+        "domain": data.get("domain") or "sales",
         "title": data.get("title") or "Untitled session",
         "status": data.get("status"),
         "source": data.get("source"),
@@ -626,6 +704,8 @@ def session_row_to_dict(row, include_summary=True):
         "effective_location": effective_location,
         "voicepuck": voicepuck,
         "processing_error": data.get("processing_error"),
+        "linked_context": linked_context,
+        "suggested_context": suggested_context,
         "linked_opportunity": (
             {
                 "id": data.get("linked_opportunity_id"),
@@ -4420,14 +4500,18 @@ class SessionIntelligence(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     customer_needs: list[str] = Field(default_factory=list)
     products_discussed: list[str] = Field(default_factory=list)
+    assets_discussed: list[str] = Field(default_factory=list)
+    work_orders_mentioned: list[str] = Field(default_factory=list)
     competitors: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     follow_ups: list[str] = Field(default_factory=list)
     rep_commitments: list[str] = Field(default_factory=list)
+    engineer_commitments: list[str] = Field(default_factory=list)
     customer_commitments: list[str] = Field(default_factory=list)
     people_mentioned: list[str] = Field(default_factory=list)
     linked_opportunity_id: Optional[str] = None
+    linked_work_order_id: Optional[str] = None
     link_confidence: float = 0.0
     link_reason: str = ""
 
@@ -4473,6 +4557,129 @@ def open_opportunity_candidates(sf, salesforce_username):
             ],
         })
     return candidates
+
+
+def _session_date_window(started_at):
+    try:
+        parsed = datetime.fromisoformat(str(started_at or "").replace("Z", "+00:00"))
+    except Exception:
+        parsed = datetime.now(timezone.utc)
+    start = (parsed.date() - timedelta(days=5)).isoformat()
+    end = (parsed.date() + timedelta(days=5)).isoformat()
+    return start, end
+
+
+def field_work_order_candidates(session_row):
+    date_from, date_to = _session_date_window(session_row["started_at"])
+    result = session_field_adapter_tool(
+        "work.search",
+        {
+            "query": None,
+            "date": None,
+            "date_from": date_from,
+            "date_to": date_to,
+            "status": None,
+            "limit": 80,
+        },
+        session_id=f"session-link-{session_row['session_id']}",
+    )
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "Field Service work-order search failed.")
+    candidates = []
+    for item in result.get("items") or []:
+        wo = item.get("work_order") or {}
+        account = item.get("account") or {}
+        site = item.get("site") or {}
+        asset = item.get("asset") or {}
+        work_order_id = wo.get("work_order_id") or wo.get("id")
+        if not work_order_id:
+            continue
+        account_name = account.get("name") or account.get("account_name") or wo.get("account_name")
+        asset_name = asset.get("product_name") or asset.get("name") or wo.get("product_name")
+        candidates.append({
+            "id": work_order_id,
+            "label": f"{account_name or 'Customer'} · {asset_name or 'Instrument'}",
+            "account": account_name,
+            "site": site.get("site_name") or site.get("name"),
+            "asset": asset_name,
+            "scheduled_start": wo.get("scheduled_start"),
+            "status": wo.get("status"),
+            "subject": wo.get("subject") or wo.get("issue_summary") or wo.get("description"),
+        })
+    return candidates
+
+
+def analyze_field_session_transcript(transcript_payload, candidates):
+    segment_text = format_transcript_text(transcript_payload)
+    if len(segment_text) > 140000:
+        segment_text = segment_text[:140000]
+    candidate_payload = json.dumps(candidates, default=str)[:65000]
+    instructions = """
+You are Meyora's post-session intelligence engine for a Field Service engineer.
+Analyze the speaker-labelled conversation and compare it with the supplied C4C work-order
+candidates.
+
+Rules:
+- Never invent a work order. linked_work_order_id must be null or exactly one supplied candidate id.
+- Link only when customer/site/asset/issue/date evidence meaningfully matches.
+- A confidence >= 0.82 should mean a strong match suitable for automatic Session linking.
+- Lower-confidence plausible matches may be returned as suggestions.
+- Summaries must distinguish customer needs, engineer commitments, customer commitments,
+  decisions, risks, and concrete follow-ups.
+- products_discussed may contain instrument/product names; assets_discussed should contain
+  specific asset/instrument references when identifiable.
+- Do not perform C4C, Outlook, Teams, inventory, or calendar writes.
+"""
+    response = openai_client.responses.parse(
+        model="gpt-5.6-terra",
+        reasoning={"effort": "medium"},
+        store=False,
+        input=[
+            {"role": "developer", "content": instructions + "\n\n" + configurable_context_prompt()},
+            {
+                "role": "user",
+                "content": (
+                    "C4C WORK-ORDER CANDIDATES:\n" + candidate_payload
+                    + "\n\nDIARIZED SESSION TRANSCRIPT:\n" + segment_text
+                ),
+            },
+        ],
+        text_format=SessionIntelligence,
+    )
+    parsed = response.output_parsed
+    if parsed is None:
+        raise RuntimeError("Field Service Session intelligence returned no structured result.")
+    result = parsed.model_dump()
+    if result.get("engineer_commitments") and not result.get("rep_commitments"):
+        result["rep_commitments"] = list(result["engineer_commitments"])
+    return result
+
+
+def validate_field_work_order(work_order_id, session_id):
+    result = session_field_adapter_tool(
+        "work.context",
+        {"work_order_id": work_order_id},
+        session_id=f"session-context-{session_id}",
+    )
+    if not result.get("ok"):
+        raise ValueError("Field Service work order was not found.")
+    ctx = result.get("context") or {}
+    wo = ctx.get("work_order") or {}
+    account = ctx.get("account") or {}
+    asset = ctx.get("asset") or {}
+    return {
+        "type": "work_order",
+        "id": wo.get("work_order_id") or wo.get("id") or work_order_id,
+        "label": (
+            (account.get("name") or account.get("account_name") or "Customer")
+            + " · "
+            + (asset.get("product_name") or asset.get("name") or "Instrument")
+        ),
+        "account": account.get("name") or account.get("account_name"),
+        "asset": asset.get("product_name") or asset.get("name"),
+        "status": wo.get("status"),
+        "scheduled_start": wo.get("scheduled_start"),
+    }
 
 
 def split_audio_if_needed(audio_path, processing_dir):
@@ -4605,6 +4812,19 @@ Rules:
 def process_session(session_id, owner_oid, salesforce_username):
     try:
         row = owner_session_row(session_id, owner_oid)
+        if not row["domain"]:
+            inferred = session_principal_from_claims({
+                "oid": row["owner_oid"],
+                "preferred_username": row["salesforce_username"],
+            })
+            with session_db() as conn:
+                conn.execute(
+                    "UPDATE sessions SET principal_id=?,domain=?,updated_at=? WHERE session_id=? AND owner_oid=?",
+                    (inferred.get("principal_id"), inferred.get("domain") or "sales", utc_now_iso(), session_id, owner_oid),
+                )
+                conn.commit()
+            row = owner_session_row(session_id, owner_oid)
+        domain = str(row["domain"] or "sales")
         audio_path = row["audio_path"]
         if not audio_path or not Path(audio_path).exists():
             raise RuntimeError("Session audio file is missing.")
@@ -4633,21 +4853,87 @@ def process_session(session_id, owner_oid, salesforce_username):
             )
             conn.commit()
 
-        sf = get_salesforce_access_token(salesforce_username)
-        candidates = open_opportunity_candidates(sf, salesforce_username)
-        intelligence = analyze_session_transcript(transcript_payload, candidates)
+        linked_context = None
+        suggested_context = None
+        linked_opportunity_id = None
+        linked_opportunity_name = None
+        linked_opportunity_confidence = None
+        suggested_opportunity_id = None
+        suggested_opportunity_name = None
+        suggested_opportunity_confidence = None
 
-        candidate_by_id = {c["id"]: c for c in candidates if c.get("id")}
-        proposed_id = intelligence.get("linked_opportunity_id")
-        confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
-        if proposed_id not in candidate_by_id:
-            proposed_id = None
-            confidence = 0.0
+        if domain == "field_service":
+            candidates = field_work_order_candidates(row)
+            intelligence = analyze_field_session_transcript(transcript_payload, candidates)
+            candidate_by_id = {item["id"]: item for item in candidates if item.get("id")}
+            proposed_id = intelligence.get("linked_work_order_id")
+            confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+            if proposed_id not in candidate_by_id:
+                proposed_id = None
+                confidence = 0.0
 
-        linked_id = proposed_id if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD else None
-        linked_name = candidate_by_id.get(linked_id, {}).get("name") if linked_id else None
-        suggested_id = proposed_id if proposed_id and not linked_id else None
-        suggested_name = candidate_by_id.get(suggested_id, {}).get("name") if suggested_id else None
+            if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD:
+                candidate = candidate_by_id[proposed_id]
+                linked_context = {
+                    "type": "work_order",
+                    "id": proposed_id,
+                    "label": candidate.get("label"),
+                    "account": candidate.get("account"),
+                    "asset": candidate.get("asset"),
+                    "scheduled_start": candidate.get("scheduled_start"),
+                    "confidence": confidence,
+                }
+            elif proposed_id:
+                candidate = candidate_by_id[proposed_id]
+                suggested_context = {
+                    "type": "work_order",
+                    "id": proposed_id,
+                    "label": candidate.get("label"),
+                    "account": candidate.get("account"),
+                    "asset": candidate.get("asset"),
+                    "scheduled_start": candidate.get("scheduled_start"),
+                    "confidence": confidence,
+                    "reason": intelligence.get("link_reason"),
+                }
+            default_title = "Field Service session"
+        else:
+            sf = get_salesforce_access_token(salesforce_username)
+            candidates = open_opportunity_candidates(sf, salesforce_username)
+            intelligence = analyze_session_transcript(transcript_payload, candidates)
+
+            candidate_by_id = {item["id"]: item for item in candidates if item.get("id")}
+            proposed_id = intelligence.get("linked_opportunity_id")
+            confidence = max(0.0, min(float(intelligence.get("link_confidence") or 0), 1.0))
+            if proposed_id not in candidate_by_id:
+                proposed_id = None
+                confidence = 0.0
+
+            if proposed_id and confidence >= SESSION_AUTO_LINK_THRESHOLD:
+                candidate = candidate_by_id[proposed_id]
+                linked_opportunity_id = proposed_id
+                linked_opportunity_name = candidate.get("name")
+                linked_opportunity_confidence = confidence
+                linked_context = {
+                    "type": "opportunity",
+                    "id": proposed_id,
+                    "label": candidate.get("name"),
+                    "account": candidate.get("account"),
+                    "confidence": confidence,
+                }
+            elif proposed_id:
+                candidate = candidate_by_id[proposed_id]
+                suggested_opportunity_id = proposed_id
+                suggested_opportunity_name = candidate.get("name")
+                suggested_opportunity_confidence = confidence
+                suggested_context = {
+                    "type": "opportunity",
+                    "id": proposed_id,
+                    "label": candidate.get("name"),
+                    "account": candidate.get("account"),
+                    "confidence": confidence,
+                    "reason": intelligence.get("link_reason"),
+                }
+            default_title = "Sales session"
 
         summary_json_path = session_dir / "summary.json"
         summary_json_path.write_text(json.dumps(intelligence, indent=2), encoding="utf-8")
@@ -4656,28 +4942,45 @@ def process_session(session_id, owner_oid, salesforce_username):
             conn.execute(
                 """
                 UPDATE sessions
-                SET status=?, title=?, summary_json_path=?, linked_opportunity_id=?, linked_opportunity_name=?,
-                    link_confidence=?, suggested_opportunity_id=?, suggested_opportunity_name=?, suggested_confidence=?,
-                    link_reason=?, processing_error=NULL, updated_at=?
+                SET status=?, title=?, summary_json_path=?,
+                    linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
+                    suggested_opportunity_id=?, suggested_opportunity_name=?, suggested_confidence=?,
+                    linked_context_json=?, suggested_context_json=?, link_reason=?,
+                    processing_error=NULL, updated_at=?
                 WHERE session_id=?
                 """,
                 (
                     "ready",
-                    (intelligence.get("title") or "Sales session")[:240],
+                    (intelligence.get("title") or default_title)[:240],
                     str(summary_json_path),
-                    linked_id,
-                    linked_name,
-                    confidence if linked_id else None,
-                    suggested_id,
-                    suggested_name,
-                    confidence if suggested_id else None,
+                    linked_opportunity_id,
+                    linked_opportunity_name,
+                    linked_opportunity_confidence,
+                    suggested_opportunity_id,
+                    suggested_opportunity_name,
+                    suggested_opportunity_confidence,
+                    json.dumps(linked_context, default=str) if linked_context else None,
+                    json.dumps(suggested_context, default=str) if suggested_context else None,
                     str(intelligence.get("link_reason") or "")[:2000],
                     utc_now_iso(),
                     session_id,
                 ),
             )
             conn.commit()
-        audit_log("session_ready", owner_oid, salesforce_username, None, "Session processing completed", {"session_id": session_id, "linked_opportunity_id": linked_id})
+
+        audit_log(
+            "session_ready",
+            owner_oid,
+            salesforce_username,
+            None,
+            "Session processing completed",
+            {
+                "session_id": session_id,
+                "domain": domain,
+                "linked_context": linked_context,
+                "suggested_context": suggested_context,
+            },
+        )
 
     except Exception as exc:
         try:
@@ -4689,8 +4992,14 @@ def process_session(session_id, owner_oid, salesforce_username):
                 conn.commit()
         except Exception:
             pass
-        audit_log("session_error", owner_oid, salesforce_username, None, "Session processing failed", {"session_id": session_id, "error": str(exc)[:2000]})
-
+        audit_log(
+            "session_error",
+            owner_oid,
+            salesforce_username,
+            None,
+            "Session processing failed",
+            {"session_id": session_id, "error": str(exc)[:2000]},
+        )
 
 SESSION_PROCESSING_IDS = set()
 SESSION_PROCESSING_LOCK = threading.Lock()
@@ -4729,6 +5038,7 @@ def insert_or_replace_uploaded_session(
     audio_bytes,
     actual_location,
     effective_location,
+    principal=None,
 ):
     now = utc_now_iso()
     voicepuck = metadata.get("voicepuck") or {
@@ -4740,14 +5050,18 @@ def insert_or_replace_uploaded_session(
         conn.execute(
             """
             INSERT INTO sessions (
-                session_id, owner_oid, salesforce_username, title, status, source,
-                started_at, ended_at, duration_ms, audio_path, audio_bytes,
+                session_id, owner_oid, salesforce_username, principal_id, domain,
+                title, status, source, started_at, ended_at, duration_ms, audio_path, audio_bytes,
                 actual_location_json, effective_location_json, voicepuck_json,
+                linked_context_json, suggested_context_json,
                 processing_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 owner_oid=excluded.owner_oid,
                 salesforce_username=excluded.salesforce_username,
+                principal_id=excluded.principal_id,
+                domain=excluded.domain,
+                title=excluded.title,
                 status=excluded.status,
                 source=excluded.source,
                 started_at=excluded.started_at,
@@ -4758,6 +5072,15 @@ def insert_or_replace_uploaded_session(
                 actual_location_json=excluded.actual_location_json,
                 effective_location_json=excluded.effective_location_json,
                 voicepuck_json=excluded.voicepuck_json,
+                linked_context_json=NULL,
+                suggested_context_json=NULL,
+                linked_opportunity_id=NULL,
+                linked_opportunity_name=NULL,
+                link_confidence=NULL,
+                suggested_opportunity_id=NULL,
+                suggested_opportunity_name=NULL,
+                suggested_confidence=NULL,
+                link_reason=NULL,
                 processing_error=NULL,
                 updated_at=excluded.updated_at
             """,
@@ -4765,6 +5088,8 @@ def insert_or_replace_uploaded_session(
                 session_id,
                 claims.get("oid"),
                 salesforce_username,
+                (principal or {}).get("principal_id"),
+                (principal or {}).get("domain") or "sales",
                 metadata.get("title") or "Processing session",
                 "uploaded",
                 metadata.get("source") or "iphone",
@@ -5157,10 +5482,12 @@ def voicepuck_upload_complete(ticket_id):
                 "sync_transport": "wifi_https",
             },
         }
-        claims = {"oid": row["owner_oid"]}
+        claims = {"oid": row["owner_oid"], "preferred_username": row["salesforce_username"]}
+        principal = session_principal_from_claims(claims)
         insert_or_replace_uploaded_session(
             row["session_id"], claims, row["salesforce_username"], metadata,
             final_path, final_path.stat().st_size, recording_location, recording_location,
+            principal=principal,
         )
         ack_id = secrets.token_urlsafe(12)
         with session_db() as conn:
@@ -5583,6 +5910,7 @@ def upload_session():
     claims = request.user_claims
     owner_oid = claims.get("oid")
     salesforce_username = claims.get("preferred_username")
+    principal = session_principal_from_claims(claims)
     if not owner_oid or not salesforce_username:
         return jsonify({"error": "identity_missing"}), 400
 
@@ -5606,9 +5934,11 @@ def upload_session():
             "geo_session_id": metadata.get("geo_session_id") or session_id,
         } if raw_location else {}
         location_context = None
-        if raw_location:
+        if raw_location and principal.get("domain") == "sales":
             sf = get_salesforce_access_token(salesforce_username)
             location_context = resolve_location_context(sf, salesforce_username, client_context, claims)
+        elif raw_location:
+            location_context = {"actual": raw_location, "effective": raw_location, "mode": "device_location"}
 
         insert_or_replace_uploaded_session(
             session_id,
@@ -5619,6 +5949,7 @@ def upload_session():
             audio_bytes,
             (location_context or {}).get("actual") if location_context else raw_location,
             (location_context or {}).get("effective") if location_context else raw_location,
+            principal=principal,
         )
         launch_session_processing(session_id, owner_oid, salesforce_username)
         row = owner_session_row(session_id, owner_oid)
@@ -5702,39 +6033,139 @@ def retry_session(session_id):
 @require_auth
 def session_link_options():
     claims = request.user_claims
+    principal = session_principal_from_claims(claims)
     try:
+        if principal.get("domain") == "field_service":
+            session_id = request.args.get("session_id")
+            if session_id:
+                row = owner_session_row(session_id, claims.get("oid"))
+                candidates = field_work_order_candidates(row)
+            else:
+                today = datetime.now(timezone.utc).date()
+                result = session_field_adapter_tool(
+                    "work.search",
+                    {
+                        "query": None,
+                        "date": None,
+                        "date_from": (today - timedelta(days=15)).isoformat(),
+                        "date_to": (today + timedelta(days=15)).isoformat(),
+                        "status": None,
+                        "limit": 100,
+                    },
+                )
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error") or "Field work-order search failed.")
+                candidates = []
+                for item in result.get("items") or []:
+                    wo = item.get("work_order") or {}
+                    account = item.get("account") or {}
+                    asset = item.get("asset") or {}
+                    work_order_id = wo.get("work_order_id") or wo.get("id")
+                    if work_order_id:
+                        candidates.append({
+                            "id": work_order_id,
+                            "label": (
+                                (account.get("name") or account.get("account_name") or "Customer")
+                                + " · "
+                                + (asset.get("product_name") or asset.get("name") or "Instrument")
+                            ),
+                            "account": account.get("name") or account.get("account_name"),
+                            "asset": asset.get("product_name") or asset.get("name"),
+                            "scheduled_start": wo.get("scheduled_start"),
+                            "status": wo.get("status"),
+                        })
+            return jsonify({"context_type": "work_order", "work_orders": candidates})
+
         sf = get_salesforce_access_token(claims.get("preferred_username"))
         candidates = open_opportunity_candidates(sf, claims.get("preferred_username"))
-        return jsonify({"opportunities": candidates})
+        return jsonify({"context_type": "opportunity", "opportunities": candidates})
     except Exception as exc:
         return jsonify({"error": "link_options_failed", "details": str(exc)}), 400
+
+
+def _link_session_context(session_id, claims, context_type, context_id):
+    row = owner_session_row(session_id, claims.get("oid"))
+    domain = str(row["domain"] or "sales")
+    linked_context = None
+    linked_id = None
+    linked_name = None
+
+    if context_id:
+        if domain == "field_service":
+            if context_type not in {None, "work_order"}:
+                raise ValueError("Field Service Sessions can only link to work orders.")
+            linked_context = validate_field_work_order(context_id, session_id)
+        else:
+            if context_type not in {None, "opportunity"}:
+                raise ValueError("Sales Sessions can only link to opportunities.")
+            sf = get_salesforce_access_token(claims.get("preferred_username"))
+            opp = get_session_open_opportunity(sf, claims.get("preferred_username"), context_id)
+            linked_id, linked_name = opp["id"], opp["name"]
+            linked_context = {
+                "type": "opportunity",
+                "id": linked_id,
+                "label": linked_name,
+                "account": opp.get("account"),
+                "confidence": 1.0,
+            }
+
+    with session_db() as conn:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET linked_context_json=?, suggested_context_json=NULL,
+                linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
+                suggested_opportunity_id=NULL, suggested_opportunity_name=NULL, suggested_confidence=NULL,
+                link_reason=?, updated_at=?
+            WHERE session_id=? AND owner_oid=?
+            """,
+            (
+                json.dumps(linked_context, default=str) if linked_context else None,
+                linked_id,
+                linked_name,
+                1.0 if linked_id else None,
+                "Manually linked by the authenticated user." if linked_context else "",
+                utc_now_iso(),
+                session_id,
+                claims.get("oid"),
+            ),
+        )
+        conn.commit()
+    return owner_session_row(session_id, claims.get("oid"))
+
+
+@app.post("/sessions/<session_id>/link-context")
+@require_auth
+def link_session_context(session_id):
+    claims = request.user_claims
+    body = request.get_json(silent=True) or {}
+    try:
+        row = _link_session_context(
+            session_id,
+            claims,
+            body.get("context_type"),
+            body.get("context_id"),
+        )
+        return jsonify({"session": session_row_to_dict(row, include_summary=True)})
+    except Exception as exc:
+        return jsonify({"error": "link_failed", "details": str(exc)}), 400
 
 
 @app.post("/sessions/<session_id>/link-opportunity")
 @require_auth
 def link_session_opportunity(session_id):
     claims = request.user_claims
+    principal = session_principal_from_claims(claims)
+    if principal.get("domain") != "sales":
+        return jsonify({"error": "link_failed", "details": "This principal does not use Salesforce Opportunity linking."}), 400
     body = request.get_json(silent=True) or {}
-    opportunity_id = body.get("opportunity_id")
     try:
-        owner_session_row(session_id, claims.get("oid"))
-        if opportunity_id:
-            sf = get_salesforce_access_token(claims.get("preferred_username"))
-            opp = get_session_open_opportunity(sf, claims.get("preferred_username"), opportunity_id)
-            linked_id, linked_name = opp["id"], opp["name"]
-        else:
-            linked_id, linked_name = None, None
-        with session_db() as conn:
-            conn.execute(
-                """
-                UPDATE sessions SET linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
-                    suggested_opportunity_id=NULL, suggested_opportunity_name=NULL, suggested_confidence=NULL,
-                    updated_at=? WHERE session_id=? AND owner_oid=?
-                """,
-                (linked_id, linked_name, 1.0 if linked_id else None, utc_now_iso(), session_id, claims.get("oid")),
-            )
-            conn.commit()
-        row = owner_session_row(session_id, claims.get("oid"))
+        row = _link_session_context(
+            session_id,
+            claims,
+            "opportunity",
+            body.get("opportunity_id"),
+        )
         return jsonify({"session": session_row_to_dict(row, include_summary=True)})
     except Exception as exc:
         return jsonify({"error": "link_failed", "details": str(exc)}), 400
@@ -6189,6 +6620,7 @@ register_meyora_core(app, {
     "CRM_READ_TOOLS": CRM_READ_TOOLS,
     "CRM_WRITE_TOOLS": CRM_WRITE_TOOLS,
     "APP_SIGNING_SECRET": APP_SIGNING_SECRET,
+    "SESSION_STORAGE_ROOT": SESSION_STORAGE_ROOT,
     "get_salesforce_access_token": get_salesforce_access_token,
     "run_function_tool": run_function_tool,
     "feature_enabled": feature_enabled,
