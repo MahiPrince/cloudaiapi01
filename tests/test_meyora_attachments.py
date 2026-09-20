@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 
 from PIL import Image
+from pypdf import PdfWriter
 from werkzeug.datastructures import FileStorage
 
 from meyora_attachments import AttachmentStore
@@ -103,6 +104,19 @@ def main():
         ))
         assert "MD Anderson" in store.get(xlsx["attachment_id"], "owner-a", True)["extracted_text"]
 
+        pdf_buffer = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        writer.write(pdf_buffer)
+        pdf = store.create("owner-a", principal, _file_storage("manual.pdf", pdf_buffer.getvalue(), "application/pdf"))
+        assert pdf["status"] in {"ready", "ready_with_warning"}
+
+        try:
+            store.create("owner-a", principal, _file_storage("fake.pdf", b"not-a-pdf", "application/pdf"))
+            raise AssertionError("mislabeled PDF unexpectedly passed signature validation")
+        except ValueError:
+            pass
+
         image_buffer = io.BytesIO()
         Image.new("RGB", (64, 64), (0, 0, 255)).save(image_buffer, format="JPEG")
         image = store.create("owner-a", principal, _file_storage("photo.jpg", image_buffer.getvalue(), "image/jpeg"))
@@ -128,9 +142,10 @@ def main():
 
         print(json.dumps({
             "ok": True,
-            "attachments_tested": len(manifest),
+            "attachments_tested": len(manifest) + 1,
             "ownership_isolation": True,
-            "types": ["txt", "csv", "docx", "xlsx", "jpg"],
+            "signature_validation": True,
+            "types": ["txt", "csv", "docx", "xlsx", "pdf", "jpg"],
         }))
 
 
