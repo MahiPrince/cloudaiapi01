@@ -669,6 +669,13 @@ def read_json_file(path_value, default=None):
 
 def session_row_to_dict(row, include_summary=True):
     data = dict(row)
+    if not data.get("domain"):
+        inferred = session_principal_from_claims({
+            "oid": data.get("owner_oid"),
+            "preferred_username": data.get("salesforce_username"),
+        })
+        data["principal_id"] = data.get("principal_id") or inferred.get("principal_id")
+        data["domain"] = inferred.get("domain") or "sales"
     summary = read_json_file(data.get("summary_json_path"), {}) if include_summary else None
     actual_location = json.loads(data.get("actual_location_json") or "null")
     effective_location = json.loads(data.get("effective_location_json") or "null")
