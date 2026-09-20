@@ -4,17 +4,20 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="csrf-token" content="{{ csrf_token }}" />
-  <title>CMD Sally Admin</title>
+  <title>Meyora Admin</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}" />
 </head>
 <body>
 <div class="app-shell">
   <aside class="sidebar">
-    <div class="brand-row"><div class="brand-mark small">S</div><div><strong>CMD Sally</strong><span>ADMIN</span></div></div>
+    <div class="brand-row"><div class="brand-mark small">S</div><div><strong>Meyora</strong><span>ADMIN</span></div></div>
     <nav id="nav">
       <button data-page="overview" class="active">Overview</button>
       <div class="nav-label">OPERATIONS</div>
       <button data-page="requests">Requests</button>
+      <button data-page="meyora-users">Users & Domains</button>
+      <button data-page="meyora-connectors">Connectors</button>
+      <button data-page="meyora-traces">Orchestration Traces</button>
       <button data-page="salesforce">Salesforce</button>
       <button data-page="sessions">Sessions</button>
       <button data-page="deleted">Deleted Sessions</button>
