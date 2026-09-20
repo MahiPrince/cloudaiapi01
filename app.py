@@ -5019,6 +5019,7 @@ def insert_or_replace_uploaded_session(
     audio_bytes,
     actual_location,
     effective_location,
+    principal=None,
 ):
     now = utc_now_iso()
     voicepuck = metadata.get("voicepuck") or {
@@ -5030,14 +5031,17 @@ def insert_or_replace_uploaded_session(
         conn.execute(
             """
             INSERT INTO sessions (
-                session_id, owner_oid, salesforce_username, title, status, source,
-                started_at, ended_at, duration_ms, audio_path, audio_bytes,
+                session_id, owner_oid, salesforce_username, principal_id, domain,
+                title, status, source, started_at, ended_at, duration_ms, audio_path, audio_bytes,
                 actual_location_json, effective_location_json, voicepuck_json,
+                linked_context_json, suggested_context_json,
                 processing_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 owner_oid=excluded.owner_oid,
                 salesforce_username=excluded.salesforce_username,
+                principal_id=excluded.principal_id,
+                domain=excluded.domain,
                 status=excluded.status,
                 source=excluded.source,
                 started_at=excluded.started_at,
@@ -5055,6 +5059,8 @@ def insert_or_replace_uploaded_session(
                 session_id,
                 claims.get("oid"),
                 salesforce_username,
+                (principal or {}).get("principal_id"),
+                (principal or {}).get("domain") or "sales",
                 metadata.get("title") or "Processing session",
                 "uploaded",
                 metadata.get("source") or "iphone",
