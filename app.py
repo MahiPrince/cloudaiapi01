@@ -71,6 +71,8 @@ SESSION_CHUNK_SECONDS = int(os.environ.get("SESSION_CHUNK_SECONDS", "1200"))
 VOICEPUCK_TICKET_TTL_SECONDS = max(300, min(int(os.environ.get("VOICEPUCK_TICKET_TTL_SECONDS", "1800")), 7200))
 VOICEPUCK_MAX_CHUNK_BYTES = max(1_000_000, min(int(os.environ.get("VOICEPUCK_MAX_CHUNK_BYTES", "16000000")), 32_000_000))
 VOICEPUCK_MAX_SESSION_BYTES = max(VOICEPUCK_MAX_CHUNK_BYTES, min(int(os.environ.get("VOICEPUCK_MAX_SESSION_BYTES", "1000000000")), 2_000_000_000))
+MEYORA_FIELD_ADAPTER_URL = os.environ.get("MEYORA_FIELD_ADAPTER_URL", "https://meyora-field-demo-api.onrender.com").rstrip("/")
+MEYORA_FIELD_ADAPTER_TOKEN = os.environ.get("MEYORA_FIELD_ADAPTER_TOKEN", "").strip()
 
 # Demo admin console. No default password is provided: /admin remains unavailable
 # until these values are configured in Render.
@@ -170,6 +172,10 @@ def init_session_db():
         _ensure_column(conn, "sessions", "deleted_at", "TEXT")
         _ensure_column(conn, "sessions", "deleted_by", "TEXT")
         _ensure_column(conn, "sessions", "deleted_archive_path", "TEXT")
+        _ensure_column(conn, "sessions", "principal_id", "TEXT")
+        _ensure_column(conn, "sessions", "domain", "TEXT")
+        _ensure_column(conn, "sessions", "linked_context_json", "TEXT")
+        _ensure_column(conn, "sessions", "suggested_context_json", "TEXT")
 
         conn.execute(
             """CREATE TABLE IF NOT EXISTS audit_events (
@@ -578,6 +584,67 @@ def recover_completed_voicepuck_sync(owner_oid, device_id, session_id):
     if not ticket_row:
         raise RuntimeError("VoicePuck Session exists, but no completed server ACK is available for safe deletion.")
     return voicepuck_ticket_public(ticket_row)
+
+
+def session_principal_from_claims(claims):
+    raw = os.environ.get("MEYORA_PRINCIPALS_JSON", "[]")
+    try:
+        items = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError("MEYORA_PRINCIPALS_JSON is invalid JSON") from exc
+    oid = str((claims or {}).get("oid") or "").strip()
+    upn = str((claims or {}).get("preferred_username") or (claims or {}).get("upn") or "").strip().lower()
+    for item in items if isinstance(items, list) else []:
+        match = item.get("match") or {}
+        match_oid = str(match.get("oid") or "").strip()
+        match_upn = str(match.get("username") or "").strip().lower()
+        if (oid and match_oid and oid == match_oid) or (upn and match_upn and upn == match_upn):
+            return {
+                "principal_id": str(item.get("principal_id") or ""),
+                "display_name": str(item.get("display_name") or item.get("principal_id") or "Meyora User"),
+                "role": str(item.get("role") or "User"),
+                "domain": str(item.get("domain") or "sales"),
+                "entra_oid": oid or match_oid or None,
+                "entra_upn": upn or match_upn or None,
+            }
+    return {
+        "principal_id": "legacy-sales",
+        "display_name": str((claims or {}).get("name") or "Meyora User"),
+        "role": "User",
+        "domain": "sales",
+        "entra_oid": oid or None,
+        "entra_upn": upn or None,
+    }
+
+
+def session_field_adapter_tool(name, arguments, session_id="session-intelligence"):
+    if not MEYORA_FIELD_ADAPTER_TOKEN:
+        raise RuntimeError("MEYORA_FIELD_ADAPTER_TOKEN is not configured.")
+    attempts = 4
+    last = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep((0, 2, 5, 9)[attempt])
+        try:
+            response = requests.post(
+                MEYORA_FIELD_ADAPTER_URL + "/adapter/tool",
+                headers={"Authorization": "Bearer " + MEYORA_FIELD_ADAPTER_TOKEN},
+                json={"name": name, "arguments": arguments or {}, "session_id": session_id},
+                timeout=75,
+            )
+            if response.status_code in {502, 503, 504} and attempt < attempts - 1:
+                last = f"HTTP {response.status_code}"
+                continue
+            try:
+                body = response.json()
+            except Exception:
+                body = {"ok": False, "error": f"non_json_adapter_{response.status_code}"}
+            if not response.ok:
+                body.setdefault("ok", False)
+            return body
+        except requests.RequestException as exc:
+            last = str(exc)
+    return {"ok": False, "error": "field_adapter_unavailable", "details": last}
 
 
 def owner_session_row(session_id, owner_oid):
