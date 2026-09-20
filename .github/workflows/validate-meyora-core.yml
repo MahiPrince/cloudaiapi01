@@ -1,7 +1,7 @@
 name: Validate Meyora Core
 on:
   push:
-    branches: [main, meyora-core-v1]
+    branches: [main, meyora-core-v1, meyora-v4.6-backend]
   pull_request:
     branches: [main]
 
@@ -16,7 +16,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
       - name: Python syntax
-        run: python -m py_compile app.py meyora_core.py
+        run: python -m py_compile app.py meyora_core.py meyora_attachments.py
       - name: Admin JavaScript syntax
         run: node --check static/admin.js
