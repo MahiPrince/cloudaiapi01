@@ -1,7 +1,7 @@
 name: Validate Meyora Core
 on:
   push:
-    branches: [meyora-core-v1]
+    branches: [main, meyora-core-v1]
   pull_request:
     branches: [main]
 
