@@ -6004,39 +6004,139 @@ def retry_session(session_id):
 @require_auth
 def session_link_options():
     claims = request.user_claims
+    principal = session_principal_from_claims(claims)
     try:
+        if principal.get("domain") == "field_service":
+            session_id = request.args.get("session_id")
+            if session_id:
+                row = owner_session_row(session_id, claims.get("oid"))
+                candidates = field_work_order_candidates(row)
+            else:
+                today = datetime.now(timezone.utc).date()
+                result = session_field_adapter_tool(
+                    "work.search",
+                    {
+                        "query": None,
+                        "date": None,
+                        "date_from": (today - timedelta(days=15)).isoformat(),
+                        "date_to": (today + timedelta(days=15)).isoformat(),
+                        "status": None,
+                        "limit": 100,
+                    },
+                )
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error") or "Field work-order search failed.")
+                candidates = []
+                for item in result.get("items") or []:
+                    wo = item.get("work_order") or {}
+                    account = item.get("account") or {}
+                    asset = item.get("asset") or {}
+                    work_order_id = wo.get("work_order_id") or wo.get("id")
+                    if work_order_id:
+                        candidates.append({
+                            "id": work_order_id,
+                            "label": (
+                                (account.get("name") or account.get("account_name") or "Customer")
+                                + " · "
+                                + (asset.get("product_name") or asset.get("name") or "Instrument")
+                            ),
+                            "account": account.get("name") or account.get("account_name"),
+                            "asset": asset.get("product_name") or asset.get("name"),
+                            "scheduled_start": wo.get("scheduled_start"),
+                            "status": wo.get("status"),
+                        })
+            return jsonify({"context_type": "work_order", "work_orders": candidates})
+
         sf = get_salesforce_access_token(claims.get("preferred_username"))
         candidates = open_opportunity_candidates(sf, claims.get("preferred_username"))
-        return jsonify({"opportunities": candidates})
+        return jsonify({"context_type": "opportunity", "opportunities": candidates})
     except Exception as exc:
         return jsonify({"error": "link_options_failed", "details": str(exc)}), 400
+
+
+def _link_session_context(session_id, claims, context_type, context_id):
+    row = owner_session_row(session_id, claims.get("oid"))
+    domain = str(row["domain"] or "sales")
+    linked_context = None
+    linked_id = None
+    linked_name = None
+
+    if context_id:
+        if domain == "field_service":
+            if context_type not in {None, "work_order"}:
+                raise ValueError("Field Service Sessions can only link to work orders.")
+            linked_context = validate_field_work_order(context_id, session_id)
+        else:
+            if context_type not in {None, "opportunity"}:
+                raise ValueError("Sales Sessions can only link to opportunities.")
+            sf = get_salesforce_access_token(claims.get("preferred_username"))
+            opp = get_session_open_opportunity(sf, claims.get("preferred_username"), context_id)
+            linked_id, linked_name = opp["id"], opp["name"]
+            linked_context = {
+                "type": "opportunity",
+                "id": linked_id,
+                "label": linked_name,
+                "account": opp.get("account"),
+                "confidence": 1.0,
+            }
+
+    with session_db() as conn:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET linked_context_json=?, suggested_context_json=NULL,
+                linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
+                suggested_opportunity_id=NULL, suggested_opportunity_name=NULL, suggested_confidence=NULL,
+                link_reason=?, updated_at=?
+            WHERE session_id=? AND owner_oid=?
+            """,
+            (
+                json.dumps(linked_context, default=str) if linked_context else None,
+                linked_id,
+                linked_name,
+                1.0 if linked_id else None,
+                "Manually linked by the authenticated user." if linked_context else "",
+                utc_now_iso(),
+                session_id,
+                claims.get("oid"),
+            ),
+        )
+        conn.commit()
+    return owner_session_row(session_id, claims.get("oid"))
+
+
+@app.post("/sessions/<session_id>/link-context")
+@require_auth
+def link_session_context(session_id):
+    claims = request.user_claims
+    body = request.get_json(silent=True) or {}
+    try:
+        row = _link_session_context(
+            session_id,
+            claims,
+            body.get("context_type"),
+            body.get("context_id"),
+        )
+        return jsonify({"session": session_row_to_dict(row, include_summary=True)})
+    except Exception as exc:
+        return jsonify({"error": "link_failed", "details": str(exc)}), 400
 
 
 @app.post("/sessions/<session_id>/link-opportunity")
 @require_auth
 def link_session_opportunity(session_id):
     claims = request.user_claims
+    principal = session_principal_from_claims(claims)
+    if principal.get("domain") != "sales":
+        return jsonify({"error": "link_failed", "details": "This principal does not use Salesforce Opportunity linking."}), 400
     body = request.get_json(silent=True) or {}
-    opportunity_id = body.get("opportunity_id")
     try:
-        owner_session_row(session_id, claims.get("oid"))
-        if opportunity_id:
-            sf = get_salesforce_access_token(claims.get("preferred_username"))
-            opp = get_session_open_opportunity(sf, claims.get("preferred_username"), opportunity_id)
-            linked_id, linked_name = opp["id"], opp["name"]
-        else:
-            linked_id, linked_name = None, None
-        with session_db() as conn:
-            conn.execute(
-                """
-                UPDATE sessions SET linked_opportunity_id=?, linked_opportunity_name=?, link_confidence=?,
-                    suggested_opportunity_id=NULL, suggested_opportunity_name=NULL, suggested_confidence=NULL,
-                    updated_at=? WHERE session_id=? AND owner_oid=?
-                """,
-                (linked_id, linked_name, 1.0 if linked_id else None, utc_now_iso(), session_id, claims.get("oid")),
-            )
-            conn.commit()
-        row = owner_session_row(session_id, claims.get("oid"))
+        row = _link_session_context(
+            session_id,
+            claims,
+            "opportunity",
+            body.get("opportunity_id"),
+        )
         return jsonify({"session": session_row_to_dict(row, include_summary=True)})
     except Exception as exc:
         return jsonify({"error": "link_failed", "details": str(exc)}), 400
