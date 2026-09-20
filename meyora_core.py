@@ -255,18 +255,18 @@ Use the same routing logic for every domain. Identity only changes available cap
     def current_principal(): return principal(request.user_claims)
 
     @app.get("/meyora/health")
-    def health(): return {"ok":True,"version":CORE_VERSION,"architecture":"one_router_capabilities_connector_adapters","field_adapter_configured":bool(FIELD_ADAPTER_URL and FIELD_ADAPTER_TOKEN)}
+    def meyora_health(): return {"ok":True,"version":CORE_VERSION,"architecture":"one_router_capabilities_connector_adapters","field_adapter_configured":bool(FIELD_ADAPTER_URL and FIELD_ADAPTER_TOKEN)}
 
     @app.get("/meyora/me")
     @require_auth
-    def me():
+    def meyora_me():
         p=current_principal()
         if not p: return jsonify({"error":"meyora_principal_not_configured"}),403
         return jsonify({"principal":{k:p.get(k) for k in ("principal_id","display_name","role","domain","entra_upn")},"capabilities":sorted({r["capability_id"] for r in caps(p)})})
 
     @app.post("/meyora/chat")
     @require_auth
-    def chat():
+    def meyora_chat():
         p=current_principal()
         if not p: return jsonify({"error":"meyora_principal_not_configured"}),403
         req="myr_"+uuid.uuid4().hex[:20]
@@ -276,7 +276,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.post("/meyora/actions/confirm")
     @require_auth
-    def confirm():
+    def meyora_action_confirm():
         p=current_principal(); body=request.get_json(silent=True) or {}; tok=body.get("confirmation_token")
         if not p: return jsonify({"error":"meyora_principal_not_configured"}),403
         if not tok: return jsonify({"error":"confirmation_token_required"}),400
@@ -291,7 +291,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.post("/meyora/actions/cancel")
     @require_auth
-    def cancel():
+    def meyora_action_cancel():
         p=current_principal(); body=request.get_json(silent=True) or {}; tok=body.get("confirmation_token")
         if not p: return jsonify({"error":"meyora_principal_not_configured"}),403
         if p["domain"]=="sales": return jsonify({"ok":True,"status":"canceled"})
@@ -302,7 +302,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.get("/admin/api/meyora/overview")
     @admin_read
-    def admin_overview():
+    def admin_meyora_overview():
         with db() as c:
             users=[dict(r) for r in c.execute("SELECT p.*,(SELECT count(*) FROM meyora_principal_capabilities pc WHERE pc.principal_id=p.principal_id AND pc.enabled=1) capability_count FROM meyora_principals p ORDER BY p.display_name").fetchall()]
             cnt=c.execute("SELECT count(*) total,sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,sum(CASE WHEN domain='sales' THEN 1 ELSE 0 END) sales,sum(CASE WHEN domain='field_service' THEN 1 ELSE 0 END) field_service FROM meyora_requests").fetchone()
@@ -311,14 +311,14 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.get("/admin/api/meyora/requests")
     @admin_read
-    def admin_requests():
+    def admin_meyora_requests():
         lim=max(1,min(int(request.args.get("limit",100)),500))
         with db() as c: rows=[dict(r) for r in c.execute("SELECT * FROM meyora_requests ORDER BY created_at DESC LIMIT ?",(lim,)).fetchall()]
         return jsonify({"requests":rows})
 
     @app.get("/admin/api/meyora/requests/<request_id>")
     @admin_read
-    def admin_request(request_id):
+    def admin_meyora_request(request_id):
         with db() as c:
             r=c.execute("SELECT * FROM meyora_requests WHERE request_id=?",(request_id,)).fetchone()
             if not r: return jsonify({"error":"request_not_found"}),404
@@ -327,7 +327,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.get("/admin/api/meyora/capabilities")
     @admin_read
-    def admin_caps():
+    def admin_meyora_capabilities():
         pid=request.args.get("principal_id")
         with db() as c:
             if pid: rows=[dict(r) for r in c.execute("SELECT x.*,pc.enabled principal_enabled FROM meyora_capabilities x LEFT JOIN meyora_principal_capabilities pc ON pc.domain=x.domain AND pc.capability_id=x.capability_id AND pc.tool_name=x.tool_name AND pc.principal_id=? ORDER BY x.domain,x.capability_id",(pid,)).fetchall()]
@@ -336,7 +336,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.post("/admin/api/meyora/capabilities")
     @admin_write
-    def admin_caps_write():
+    def admin_meyora_capabilities_update():
         b=request.get_json(silent=True) or {}; keys=("principal_id","domain","capability_id","tool_name")
         if not all(b.get(k) for k in keys): return jsonify({"error":"missing_fields"}),400
         with db() as c:
@@ -345,7 +345,7 @@ Use the same routing logic for every domain. Identity only changes available cap
 
     @app.get("/admin/api/meyora/field-coverage")
     @admin_read
-    def field_coverage():
+    def admin_meyora_field_coverage():
         try:
             r=requests.get(FIELD_ADAPTER_URL+"/adapter/coverage",headers={"Authorization":"Bearer "+FIELD_ADAPTER_TOKEN},timeout=45)
             return jsonify(r.json()),r.status_code
