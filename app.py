@@ -4487,14 +4487,18 @@ class SessionIntelligence(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     customer_needs: list[str] = Field(default_factory=list)
     products_discussed: list[str] = Field(default_factory=list)
+    assets_discussed: list[str] = Field(default_factory=list)
+    work_orders_mentioned: list[str] = Field(default_factory=list)
     competitors: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     follow_ups: list[str] = Field(default_factory=list)
     rep_commitments: list[str] = Field(default_factory=list)
+    engineer_commitments: list[str] = Field(default_factory=list)
     customer_commitments: list[str] = Field(default_factory=list)
     people_mentioned: list[str] = Field(default_factory=list)
     linked_opportunity_id: Optional[str] = None
+    linked_work_order_id: Optional[str] = None
     link_confidence: float = 0.0
     link_reason: str = ""
 
@@ -4540,6 +4544,129 @@ def open_opportunity_candidates(sf, salesforce_username):
             ],
         })
     return candidates
+
+
+def _session_date_window(started_at):
+    try:
+        parsed = datetime.fromisoformat(str(started_at or "").replace("Z", "+00:00"))
+    except Exception:
+        parsed = datetime.now(timezone.utc)
+    start = (parsed.date() - timedelta(days=5)).isoformat()
+    end = (parsed.date() + timedelta(days=5)).isoformat()
+    return start, end
+
+
+def field_work_order_candidates(session_row):
+    date_from, date_to = _session_date_window(session_row["started_at"])
+    result = session_field_adapter_tool(
+        "work.search",
+        {
+            "query": None,
+            "date": None,
+            "date_from": date_from,
+            "date_to": date_to,
+            "status": None,
+            "limit": 80,
+        },
+        session_id=f"session-link-{session_row['session_id']}",
+    )
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "Field Service work-order search failed.")
+    candidates = []
+    for item in result.get("items") or []:
+        wo = item.get("work_order") or {}
+        account = item.get("account") or {}
+        site = item.get("site") or {}
+        asset = item.get("asset") or {}
+        work_order_id = wo.get("work_order_id") or wo.get("id")
+        if not work_order_id:
+            continue
+        account_name = account.get("name") or account.get("account_name") or wo.get("account_name")
+        asset_name = asset.get("product_name") or asset.get("name") or wo.get("product_name")
+        candidates.append({
+            "id": work_order_id,
+            "label": f"{account_name or 'Customer'} · {asset_name or 'Instrument'}",
+            "account": account_name,
+            "site": site.get("site_name") or site.get("name"),
+            "asset": asset_name,
+            "scheduled_start": wo.get("scheduled_start"),
+            "status": wo.get("status"),
+            "subject": wo.get("subject") or wo.get("issue_summary") or wo.get("description"),
+        })
+    return candidates
+
+
+def analyze_field_session_transcript(transcript_payload, candidates):
+    segment_text = format_transcript_text(transcript_payload)
+    if len(segment_text) > 140000:
+        segment_text = segment_text[:140000]
+    candidate_payload = json.dumps(candidates, default=str)[:65000]
+    instructions = """
+You are Meyora's post-session intelligence engine for a Field Service engineer.
+Analyze the speaker-labelled conversation and compare it with the supplied C4C work-order
+candidates.
+
+Rules:
+- Never invent a work order. linked_work_order_id must be null or exactly one supplied candidate id.
+- Link only when customer/site/asset/issue/date evidence meaningfully matches.
+- A confidence >= 0.82 should mean a strong match suitable for automatic Session linking.
+- Lower-confidence plausible matches may be returned as suggestions.
+- Summaries must distinguish customer needs, engineer commitments, customer commitments,
+  decisions, risks, and concrete follow-ups.
+- products_discussed may contain instrument/product names; assets_discussed should contain
+  specific asset/instrument references when identifiable.
+- Do not perform C4C, Outlook, Teams, inventory, or calendar writes.
+"""
+    response = openai_client.responses.parse(
+        model="gpt-5.6-terra",
+        reasoning={"effort": "medium"},
+        store=False,
+        input=[
+            {"role": "developer", "content": instructions + "\n\n" + configurable_context_prompt()},
+            {
+                "role": "user",
+                "content": (
+                    "C4C WORK-ORDER CANDIDATES:\n" + candidate_payload
+                    + "\n\nDIARIZED SESSION TRANSCRIPT:\n" + segment_text
+                ),
+            },
+        ],
+        text_format=SessionIntelligence,
+    )
+    parsed = response.output_parsed
+    if parsed is None:
+        raise RuntimeError("Field Service Session intelligence returned no structured result.")
+    result = parsed.model_dump()
+    if result.get("engineer_commitments") and not result.get("rep_commitments"):
+        result["rep_commitments"] = list(result["engineer_commitments"])
+    return result
+
+
+def validate_field_work_order(work_order_id, session_id):
+    result = session_field_adapter_tool(
+        "work.context",
+        {"work_order_id": work_order_id},
+        session_id=f"session-context-{session_id}",
+    )
+    if not result.get("ok"):
+        raise ValueError("Field Service work order was not found.")
+    ctx = result.get("context") or {}
+    wo = ctx.get("work_order") or {}
+    account = ctx.get("account") or {}
+    asset = ctx.get("asset") or {}
+    return {
+        "type": "work_order",
+        "id": wo.get("work_order_id") or wo.get("id") or work_order_id,
+        "label": (
+            (account.get("name") or account.get("account_name") or "Customer")
+            + " · "
+            + (asset.get("product_name") or asset.get("name") or "Instrument")
+        ),
+        "account": account.get("name") or account.get("account_name"),
+        "asset": asset.get("product_name") or asset.get("name"),
+        "status": wo.get("status"),
+        "scheduled_start": wo.get("scheduled_start"),
+    }
 
 
 def split_audio_if_needed(audio_path, processing_dir):
