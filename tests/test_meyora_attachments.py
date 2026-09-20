@@ -1,9 +1,12 @@
 import io
 import json
 import sqlite3
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PIL import Image
 from pypdf import PdfWriter
