@@ -153,9 +153,12 @@ Use the same routing logic for every domain. Identity only changes available cap
         return out
 
     def field_call(name,args,session_id):
-        attempts=1 if name in FIELD_WRITE_TOOLS else 3; last=None
+        # Read/chat operations may need to wake a free Render adapter.
+        # Keep governed write proposals single-attempt to avoid duplicate side effects.
+        attempts=1 if name in FIELD_WRITE_TOOLS else 5; last=None
+        wake_delays=(0,3,7,12,18)
         for i in range(attempts):
-            if i: time.sleep((0,2,5)[i])
+            if i: time.sleep(wake_delays[i])
             try:
                 r=requests.post(FIELD_ADAPTER_URL+"/adapter/tool",headers={"Authorization":"Bearer "+FIELD_ADAPTER_TOKEN},json={"name":FIELD_TOOL_MAP[name],"arguments":args or {},"session_id":session_id},timeout=75)
                 if r.status_code in {502,503,504} and i<attempts-1: last=f"HTTP {r.status_code}"; continue
