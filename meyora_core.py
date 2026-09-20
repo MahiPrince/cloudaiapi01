@@ -300,6 +300,8 @@ Use the same routing logic for every domain. Identity only changes available cap
         if p["domain"]=="sales": return jsonify({"ok":True,"status":"canceled"})
         try:
             data=jwt.decode(tok,secret,algorithms=["HS256"],audience="meyora-action",issuer="meyora-core")
+            if data.get("oid")!=request.user_claims.get("oid") or data.get("principal_id")!=p["principal_id"]:
+                raise ValueError("confirmation_identity_mismatch")
             return jsonify({"ok":True,"result":field_action(data["action_id"],data["session_id"],"cancel")})
         except Exception as exc: return jsonify({"error":"action_cancel_failed","details":str(exc)[:1500]}),400
 
